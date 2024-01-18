@@ -1,6 +1,8 @@
 #!/bin/bash
 
-#IMPORTANT NOTE
+######################################################################
+######################IMPORTANT NOTE:#################################
+######################################################################
 #DO REFERESH THE PERMISSIONS FROM APPLCIATIONS TAB 
 #DO RUN wp-redis activate --force--allow-root < if it does not run by itself. 
 
