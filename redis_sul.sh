@@ -106,8 +106,8 @@ PHP
     ln -s "$dir_name" "$symlink_target"
 fi
 
-# Cleanup: Delete abc.txt
-rm -f abc.txt
+# Cleanup: Delete 1_random_redis_file.txt
+rm -f 1_random_redis_file.txt
 
 # Run wp redis activate
 wp redis activate --force --allow-root
