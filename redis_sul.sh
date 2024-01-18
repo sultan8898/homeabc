@@ -1,5 +1,9 @@
 #!/bin/bash
 
+#IMPORTANT NOTE
+#DO REFERESH THE PERMISSIONS FROM APPLCIATIONS TAB 
+#DO RUN wp-redis activate --force--allow-root < if it does not run by itself. 
+
 # Part 1: Extract and save 4 letters to 1_random_redis_file.txt
 cd ../conf
 content=$(cat server.nginx)
