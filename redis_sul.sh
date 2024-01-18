@@ -28,7 +28,7 @@ define( 'WP_REDIS_CONFIG', [
    'token' => "e279430effe043b8c17d3f3c751c4c0846bc70c97f0eaaea766b4079001c",
    'host' => '127.0.0.1',
    'port' => 6379,
-   'database' => "$last_four", 
+   'database' => $last_four, 
    'timeout' => 2.5,
    'read_timeout' => 2.5,
    'split_alloptions' => true,
