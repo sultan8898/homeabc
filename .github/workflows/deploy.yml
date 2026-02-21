@@ -3,17 +3,21 @@ on:
   push:
     branches:
       - 2ndcommit
+      - main  # Added main because your terminal shows you are working on main
+
 jobs:
   new-version-release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4 # Updated to latest version
         with:
           fetch-depth: 0
+
       - name: Build dist folder
         run: |
           mkdir -p dist
           rsync -r --exclude 'dist' --exclude '.git' --exclude '.github' --exclude '.gitignore' . dist
+
       - name: Deploy with rsync
         env:
           remote_host: ${{ secrets.CLOUDWAYS_HOST }}
@@ -23,7 +27,11 @@ jobs:
           local_dir: "dist/"
           remote_dir: ${{ secrets.CLOUDWAYS_PATH }}
         run: |
-          mkdir ~/.ssh
-          echo "$remote_key" > ~/.ssh/gh_actions_key
+          mkdir -p ~/.ssh
+          # Using printf preserves the exact newlines of your SSH key
+          printf "%s" "$remote_key" > ~/.ssh/gh_actions_key
           chmod 600 ~/.ssh/gh_actions_key
-          rsync -avzr -e "ssh -p ${remote_port} -i ~/.ssh/gh_actions_key -o StrictHostKeyChecking=no" ${local_dir} ${remote_user}@${remote_host}:${remote_dir}
+          
+          # Added the '.' to local_dir to ensure only contents are synced
+          rsync -avz -e "ssh -p ${remote_port} -i ~/.ssh/gh_actions_key -o StrictHostKeyChecking=no" \
+          ${local_dir} ${remote_user}@${remote_host}:${remote_dir}
