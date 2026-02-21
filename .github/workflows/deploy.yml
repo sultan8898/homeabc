@@ -2,28 +2,22 @@ name: deploy
 on:
   push:
     branches:
-      - main
+      - 2ndcommit 
+
 jobs:
   new-version-release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4 # Updated to v4
         with:
           fetch-depth: 0
-      - name: Build dist folder
-        run: |
-          mkdir -p dist
-          rsync -r --exclude 'dist' --exclude '.git' --exclude '.github' --exclude '.gitignore' . dist
+
       - name: Deploy with rsync
         env:
-          remote_host: ${{ secrets.CLOUDWAYS_HOST }}
-          remote_port: "22"
-          remote_user: ${{ secrets.CLOUDWAYS_USER }}
-          remote_key: ${{ secrets.CLOUDWAYS_SSH_PRIVATE_KEY }}
-          local_dir: "dist/"
-          remote_dir: ${{ secrets.CLOUDWAYS_PATH }}
+          dest: "${{ secrets.CLOUDWAYS_USER }}@${{ secrets.CLOUDWAYS_HOST }}:${{ secrets.CLOUDWAYS_PATH }}"
         run: |
-          mkdir ~/.ssh
-          echo "$remote_key" > ~/.ssh/gh_actions_key
-          chmod 600 ~/.ssh/gh_actions_key
-          rsync -avzr -e "ssh -p ${remote_port} -i ~/.ssh/gh_actions_key -o StrictHostKeyChecking=no" ${local_dir} ${remote_user}@${remote_host}:${remote_dir}
+          mkdir -p ~/.ssh
+          echo "${{ secrets.CLOUDWAYS_SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          # This command syncs the current folder to your server
+          rsync -avz -e "ssh -o StrictHostKeyChecking=no" --exclude '.git*' --exclude '.github*' ./ ${{ env.dest }}
