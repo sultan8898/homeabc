@@ -6,9 +6,9 @@
 # Examples:
 #   curl -fsSL .../case.sh | bash -s -- triage 2000 afurtxebjn
 #   curl -fsSL .../case.sh | bash -s -- slice -a afurtxebjn -d 04/08/2026 -f 14:00 -u 14:45 --status 499
-#   curl -fsSL .../case.sh | bash -s -- ip afurtxebjn 203.0.113.1 3000
+#   curl -fsSL .../case.sh | bash -s -- location /path/to/nginx-app.status.log
 #
-# Keep temp files for debugging: CASE_KEEP_TMP=1 curl ... | bash -s -- triage 2000 afurtxebjn
+# Note: only one "--" after -s (extra "--" is ignored). Do not pipe case_slice.sh directly.
 
 CASE_RAW_BASE="${CASE_RAW_BASE:-https://raw.githubusercontent.com/sultan8898/homeabc/refs/heads/cursor/case-investigation-scripts-c2b2}"
 
@@ -77,6 +77,10 @@ EOF
 }
 
 case__main() {
+    while [[ "${1:-}" == "--" ]]; do
+        shift
+    done
+
     local cmd="${1:-help}"
     if [[ "$cmd" == "help" || "$cmd" == "-h" || "$cmd" == "--help" ]]; then
         case__usage
