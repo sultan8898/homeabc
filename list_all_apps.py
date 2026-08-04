@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-Cloudways Account App Inventory (v2 API)
+Cloudways Account App Inventory (v2 API + v1 monitor for sizes)
 
-Read-only. Lists every application on the account with per-app du -sch sizes.
+Read-only account-wide app list with per-app file + DB sizes.
 
-Requires Python 3.5+ (cw-proxy ships an older python3; this script avoids 3.6+ syntax).
+Size sources (pick at prompt):
+  api   -- v1 monitor API (all servers, no SSH/cng; ~24h lag vs live du)
+  local -- du -sch on current server only
+  cng   -- du on all servers via cw-proxy cng
+  ssh   -- du via ssh root@public_ip
+  skip
 
-Stable raw URL (pin by commit; branch URL can lag on GitHub CDN):
-    python3 <(curl -fsSL 'https://raw.githubusercontent.com/sultan8898/homeabc/95a0eeb/list_all_apps.py')
+Python 3.5+ (cw-proxy).
 
-Or download then run (best if your terminal breaks long URLs):
-    curl -fsSL -o /tmp/list_all_apps.py \\
-      'https://raw.githubusercontent.com/sultan8898/homeabc/95a0eeb/list_all_apps.py'
-    python3 /tmp/list_all_apps.py
+curl (pin by commit after push):
+  curl -fsSL -o /tmp/list_all_apps.py \\
+    'https://raw.githubusercontent.com/sultan8898/homeabc/<commit>/list_all_apps.py'
+  python3 /tmp/list_all_apps.py
 """
 
 import base64
@@ -21,6 +25,7 @@ import glob
 import os
 import re
 import sys
+import time
 import getpass
 import shutil
 import subprocess
@@ -30,14 +35,12 @@ from datetime import datetime, timedelta
 import requests
 
 if sys.version_info < (3, 5):
-    sys.exit(
-        "Python 3.5+ required. On cw-proxy try: python3 --version\n"
-        "If only 2.7 is installed, ask ops to enable python3.5+ or run from an app server."
-    )
+    sys.exit("Python 3.5+ required.")
 
-API_BASE = "https://api.cloudways.com/api/v2"
+API_V2 = "https://api.cloudways.com/api/v2"
+API_V1 = "https://api.cloudways.com/api/v1"
 TOKEN_TTL = 3600
-SCRIPT_BUILD = "py35-95a0eeb"
+SCRIPT_BUILD = "api-monitor-py35"
 
 _token_cache = {"token": None, "expires_at": None}
 
@@ -54,7 +57,7 @@ def fetch_token(email, api_key):
     print("  [token] Requesting new access token ...")
     try:
         resp = requests.post(
-            API_BASE + "/oauth/access_token",
+            API_V2 + "/oauth/access_token",
             headers={"Content-Type": "application/json", "Accept": "application/json"},
             json={"email": email, "api_key": api_key},
             timeout=30,
@@ -80,9 +83,7 @@ def auth_headers(token):
 
 def fetch_all_servers(token):
     try:
-        resp = requests.get(
-            API_BASE + "/server", headers=auth_headers(token), timeout=60,
-        )
+        resp = requests.get(API_V2 + "/server", headers=auth_headers(token), timeout=60)
         resp.raise_for_status()
         return resp.json().get("servers", [])
     except requests.RequestException as e:
@@ -101,6 +102,198 @@ def detect_local_server_id():
     except OSError:
         pass
     return ""
+
+
+def _looks_like_timestamp(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return False
+    return 1500000000 <= f <= 2100000000
+
+
+def format_mb_display(mb):
+    if mb is None:
+        return "n/a"
+    try:
+        mb = float(mb)
+    except (TypeError, ValueError):
+        return "n/a"
+    if mb >= 1024:
+        return "{:.1f}G".format(mb / 1024.0)
+    if abs(mb - int(mb)) < 0.05:
+        return "{}M".format(int(mb))
+    return "{:.1f}M".format(mb)
+
+
+def extract_size_mb(datapoint):
+    """Monitor API: datapoint is [size_mb, timestamp] or a bare number."""
+    if datapoint is None:
+        return None
+    if isinstance(datapoint, (int, float)):
+        if _looks_like_timestamp(datapoint):
+            return None
+        return float(datapoint)
+    if isinstance(datapoint, list):
+        for x in datapoint:
+            if isinstance(x, (int, float)) and not _looks_like_timestamp(x):
+                return float(x)
+    return None
+
+
+def match_app_sys_user(name, apps):
+    if not name:
+        return ""
+    name = str(name).strip()
+    nl = name.lower()
+    for app in apps:
+        su = str(app.get("sys_user", "")).strip()
+        label = str(app.get("label", "")).strip()
+        if name == su or name == label:
+            return su
+        if nl == su.lower() or nl == label.lower():
+            return su
+        fqdn = str(app.get("app_fqdn", "") or "")
+        if fqdn and nl in fqdn.lower():
+            return su
+    return ""
+
+
+def api_get_v1(token, path, params, timeout=60):
+    try:
+        resp = requests.get(
+            API_V1 + path,
+            headers=auth_headers(token),
+            params=params,
+            timeout=timeout,
+        )
+        return resp.status_code, resp.json() if resp.content else {}
+    except (requests.RequestException, ValueError) as e:
+        return 0, {"error": str(e)}
+
+
+def monitor_content_list(body):
+    if not isinstance(body, dict):
+        return []
+    content = body.get("content")
+    if isinstance(content, list):
+        return content
+    if isinstance(body.get("monitor"), dict):
+        c = body["monitor"].get("content")
+        if isinstance(c, list):
+            return c
+    return []
+
+
+def server_monitor_summary(token, server_id, summary_type):
+    code, body = api_get_v1(
+        token,
+        "/server/monitor/summary",
+        {"server_id": server_id, "type": summary_type},
+    )
+    if code != 200:
+        return None, body
+    return monitor_content_list(body), body
+
+
+def app_monitor_summary(token, server_id, app_id, summary_type):
+    code, body = api_get_v1(
+        token,
+        "/app/monitor/summary",
+        {"server_id": server_id, "app_id": app_id, "type": summary_type},
+    )
+    if code != 200:
+        return None, body
+    return monitor_content_list(body), body
+
+
+def apply_content_to_sizes(sizes, content, apps, field):
+    for item in content or []:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name") or item.get("label") or item.get("sys_user") or ""
+        mb = extract_size_mb(item.get("datapoint"))
+        if mb is None:
+            mb = extract_size_mb(item.get("size"))
+        if mb is None:
+            continue
+        su = match_app_sys_user(name, apps)
+        if not su and len(apps) == 1:
+            su = str(apps[0].get("sys_user", "")).strip()
+        if not su:
+            continue
+        sizes.setdefault(su, {})
+        sizes[su][field] = format_mb_display(mb)
+
+
+def pick_app_monitor_size(content, apps):
+    """Single-app monitor/summary: take largest numeric datapoint or named total."""
+    if not content:
+        return None
+    best = None
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).lower()
+        mb = extract_size_mb(item.get("datapoint"))
+        if mb is None:
+            continue
+        if "total" in name:
+            return mb
+        if best is None or mb > best:
+            best = mb
+    return best
+
+
+def collect_sizes_api_for_server(token, server_id, apps):
+    sizes = {}
+    debug = os.environ.get("MONITOR_DEBUG", "").strip() == "1"
+
+    # Server-wide per-app lists (fast): type=db is DB disk per app; type=disk is app files.
+    for summary_type, field in (("db", "db_size"), ("disk", "files_size")):
+        content, raw = server_monitor_summary(token, server_id, summary_type)
+        if debug:
+            print("\n  [debug] server {} type={} sample: {}".format(
+                server_id, summary_type, str(raw)[:500],
+            ))
+        if content:
+            apply_content_to_sizes(sizes, content, apps, field)
+
+    # Per-app fallback for missing columns
+    file_types = ("disk", "web", "files", "data")
+    db_types = ("db", "mysql", "database")
+
+    for app in apps:
+        su = str(app.get("sys_user", "")).strip()
+        app_id = str(app.get("id", "")).strip()
+        if not su or not app_id:
+            continue
+        entry = sizes.setdefault(su, {})
+
+        if not entry.get("files_size"):
+            for t in file_types:
+                content, _ = app_monitor_summary(token, server_id, app_id, t)
+                mb = pick_app_monitor_size(content, apps)
+                if mb is not None:
+                    entry["files_size"] = format_mb_display(mb)
+                    break
+                time.sleep(0.15)
+
+        if not entry.get("db_size"):
+            for t in db_types:
+                content, _ = app_monitor_summary(token, server_id, app_id, t)
+                mb = pick_app_monitor_size(content, apps)
+                if mb is not None:
+                    entry["db_size"] = format_mb_display(mb)
+                    break
+                time.sleep(0.15)
+
+        if not entry.get("files_size"):
+            entry["files_size"] = "n/a"
+        if not entry.get("db_size"):
+            entry["db_size"] = "n/a"
+
+    return sizes
 
 
 def build_per_app_du_script(apps):
@@ -132,13 +325,9 @@ def parse_du_output(stdout):
         if len(parts) != 3:
             continue
         sys_user = parts[0].strip()
-        files_h = parts[1].strip()
-        db_h = parts[2].strip()
-        if not sys_user:
-            continue
         sizes[sys_user] = {
-            "files_size": files_h or "n/a",
-            "db_size": db_h or "n/a",
+            "files_size": parts[1].strip() or "n/a",
+            "db_size": parts[2].strip() or "n/a",
         }
     return sizes
 
@@ -176,8 +365,7 @@ def run_remote_script(mode, server_ip, script, ssh_user, cng_argv):
     err = (result.stderr or "").strip()
     out = result.stdout or ""
     if result.returncode != 0 and not out.strip():
-        detail = err or "exit {}".format(result.returncode)
-        return out, False, detail
+        return out, False, err or "exit {}".format(result.returncode)
     return out, True, err
 
 
@@ -221,19 +409,34 @@ def server_location(srv):
     return provider or region or "n/a"
 
 
-def parse_size_mode(choice, default_digit, on_cloudways_server):
+def parse_size_mode(choice, default_digit):
     c = choice.strip().lower()
     if not c:
         c = default_digit
-    by_name = {"local": "local", "cng": "cng", "ssh": "ssh", "skip": "skip"}
-    by_digit = {"1": "local", "2": "cng", "3": "ssh", "4": "skip"}
+    by_name = {
+        "api": "api", "local": "local", "cng": "cng", "ssh": "ssh", "skip": "skip",
+    }
+    by_digit = {
+        "1": "api", "2": "local", "3": "cng", "4": "ssh", "5": "skip",
+    }
     if c in by_name:
         return by_name[c]
     if c in by_digit:
         return by_digit[c]
-    if on_cloudways_server:
-        return "local"
-    return "cng"
+    return "api"
+
+
+def lookup_app_sizes(server_sizes, app):
+    if not server_sizes or server_sizes == "SKIPPED":
+        return server_sizes
+    sys_user = str(app.get("sys_user", ""))
+    label = str(app.get("label", "")).strip()
+    entry = (
+        server_sizes.get(sys_user)
+        or server_sizes.get(label)
+        or {}
+    )
+    return entry
 
 
 def collect_rows(servers, sizes_by_server):
@@ -251,7 +454,7 @@ def collect_rows(servers, sizes_by_server):
             elif server_sizes is None:
                 files_sz = db_sz = "unavailable"
             else:
-                entry = server_sizes.get(sys_user) or {}
+                entry = lookup_app_sizes(server_sizes, app)
                 files_sz = entry.get("files_size", "n/a")
                 db_sz = entry.get("db_size", "n/a")
             rows.append({
@@ -273,7 +476,7 @@ def collect_rows(servers, sizes_by_server):
 
 def main():
     print("=" * 60)
-    print("  Cloudways Account App Inventory (v2 API, read-only)")
+    print("  Cloudways Account App Inventory (read-only)")
     print("  Python {}  build {}".format(sys.version.split()[0], SCRIPT_BUILD))
     print("=" * 60)
 
@@ -291,42 +494,55 @@ def main():
 
     local_sid = detect_local_server_id()
     on_cw = bool(local_sid)
-    default_size = "1" if on_cw else "2"
+    default_size = "2" if on_cw else "1"
+
     print("\nSize collection method:")
-    print("  1) local -- du on THIS server only (other servers: unavailable in CSV)")
-    print("  2) cng   -- ALL servers via cw-proxy: cng <server_ip> (not on app servers)")
-    print("  3) ssh   -- ALL servers: ssh root@<public_ip> each (cw-proxy or fleet SSH)")
-    print("  4) skip")
+    print("  1) api   -- monitor API files+DB all servers (no SSH; may lag ~24h)")
+    print("  2) local -- du -sch THIS server only")
+    print("  3) cng   -- du all servers via cw-proxy cng <ip>")
+    print("  4) ssh   -- du all servers via ssh root@public_ip")
+    print("  5) skip")
     if on_cw:
         print(
-            "\n  Note: you are on Cloudways server id {}. "
-            "Option 1 only runs du here. For all {} servers, use cw-proxy (cng) "
-            "or option 3 ssh if this host can reach every server IP.".format(
-                local_sid, len(servers),
-            )
+            "\n  Note: on server id {} option 2 = local du only. "
+            "Option 1 = API for all {} servers.".format(local_sid, len(servers))
         )
+
     choice = input(
-        "Choose [{}] (1-4 or local/cng/ssh/skip) : ".format(default_size)
+        "Choose [{}] (1-5 or api/local/cng/ssh/skip) : ".format(default_size)
     ).strip()
 
-    size_mode = parse_size_mode(choice, default_size, on_cw)
+    size_mode = parse_size_mode(choice, default_size)
     if size_mode == "cng" and not shutil.which("cng"):
-        print(
-            "[ERROR] `cng` is not on this host (expected on cw-proxy, not on app servers).\n"
-            "  - All servers: SSH to cw-proxy and run again, choose cng (2).\n"
-            "  - This server only: choose local (1).\n"
-            "  - All servers from here: choose ssh (3) if root SSH to each public_ip works."
-        )
+        print("[ERROR] `cng` not found. Use option 1 (api) on cw-proxy or SSH to cw-proxy.")
         sys.exit(1)
+
     sizes_by_server = {}
 
-    if size_mode == "local":
+    if size_mode == "api":
+        print("\n[2] Collecting file + DB sizes via v1 monitor API ...")
+        print("    (server/monitor/summary type=disk+db; per-app fallback if needed)")
+        for srv in servers:
+            sid = str(srv.get("id", ""))
+            apps = srv.get("apps", [])
+            print("    {} ... ".format(sid), end="")
+            sys.stdout.flush()
+            sizes = collect_sizes_api_for_server(token, sid, apps)
+            if sizes:
+                sizes_by_server[sid] = sizes
+                print("ok ({} app(s))".format(len(sizes)))
+            else:
+                sizes_by_server[sid] = None
+                print("FAILED")
+            time.sleep(0.35)
+
+    elif size_mode == "local":
         if not local_sid:
-            print("[ERROR] local mode requires /home/master/applications (not on a Cloudways server).")
+            print("[ERROR] local mode requires /home/master/applications.")
             sys.exit(1)
         target = next((s for s in servers if str(s.get("id")) == local_sid), None)
         if target is None:
-            print("[ERROR] Detected server id {} not in API account list.".format(local_sid))
+            print("[ERROR] Server id {} not in account.".format(local_sid))
             sys.exit(1)
         print("\n[2] Collecting sizes locally for server {} ...".format(local_sid))
         apps = target.get("apps", [])
@@ -336,6 +552,7 @@ def main():
             if str(sid.get("id")) != local_sid:
                 sizes_by_server[str(sid.get("id"))] = None
         print("    ok ({} app(s) sized)".format(len(sizes)))
+
     elif size_mode in ("cng", "ssh"):
         ssh_user = "root"
         cng_argv = ["cng"]
@@ -348,9 +565,9 @@ def main():
                 or "cng"
             )
             cng_argv = shlex.split(cng_prefix)
-            print("\n[2] Collecting sizes via cng (per-app du -sch) ...")
+            print("\n[2] Collecting sizes via cng (du -sch) ...")
         else:
-            print("\n[2] Collecting sizes via ssh (per-app du -sch) ...")
+            print("\n[2] Collecting sizes via ssh (du -sch) ...")
         for srv in servers:
             sid = str(srv.get("id", ""))
             ip = str(srv.get("public_ip", ""))
@@ -365,7 +582,8 @@ def main():
                 print("ok ({} app(s))".format(len(sizes)))
             else:
                 sizes_by_server[sid] = None
-                print("FAILED (sizes will show 'unavailable')")
+                print("FAILED")
+
     else:
         sizes_by_server = {str(s.get("id", "")): "SKIPPED" for s in servers}
 
