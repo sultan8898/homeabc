@@ -3,10 +3,13 @@
 #
 # Usage: ./redis_diag.sh [app]
 
+if [[ -z "${BASH_SOURCE[0]:-}" ]]; then
+    echo "Do not pipe this script to bash. Run install_case_tools.sh first." >&2
+    exit 1
+fi
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/case_tools_load.sh"
 set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=case_lib.sh
-source "$SCRIPT_DIR/case_lib.sh"
 
 APP="${1:-}"
 

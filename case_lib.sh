@@ -2,7 +2,19 @@
 # Shared helpers for case_* investigation scripts (Cloudways app log layout).
 # Source from other scripts:  source "$(dirname "$0")/case_lib.sh"
 
-APPS_BASE="${APPS_BASE:-/home/master/applications}"
+if [[ -z "${APPS_BASE:-}" ]]; then
+    if [[ -d /home/master/applications ]]; then
+        APPS_BASE="/home/master/applications"
+    else
+        _hid=$(hostname 2>/dev/null | grep -oE '^[0-9]+' || true)
+        if [[ -n "$_hid" && -d "/home/${_hid}.cloudwaysapps.com" ]]; then
+            APPS_BASE="/home/${_hid}.cloudwaysapps.com"
+        else
+            APPS_BASE="/home/master/applications"
+        fi
+    fi
+fi
+export APPS_BASE
 
 case_list_apps() {
     ls -l "$APPS_BASE" 2>/dev/null | awk '/^d/ {print $NF}' | grep -v '^\.$'

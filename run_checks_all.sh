@@ -5,10 +5,13 @@
 #
 # Requires: python3, checks.py dependencies (see requirements.txt)
 
+if [[ -z "${BASH_SOURCE[0]:-}" ]]; then
+    echo "Do not pipe this script to bash. Run install_case_tools.sh first." >&2
+    exit 1
+fi
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/case_tools_load.sh"
 set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=case_lib.sh
-source "$SCRIPT_DIR/case_lib.sh"
 
 SKIP_PLUGINS=0
 OUTPUT_DIR="${CASE_CHECKS_OUTPUT:-/home/master/case_reports}"
@@ -25,7 +28,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-CHECKS_PY="$SCRIPT_DIR/checks.py"
+CHECKS_PY="$CASE_TOOLS_DIR/checks.py"
 [[ -f "$CHECKS_PY" ]] || { echo "checks.py not found beside this script." >&2; exit 1; }
 
 mkdir -p "$OUTPUT_DIR"
