@@ -13,8 +13,8 @@
 #   --top N                       top lists size (default 10)
 
 if [[ -z "${BASH_SOURCE[0]:-}" ]]; then
-    echo "Do not pipe this script to bash. Install once:" >&2
-    echo '  curl -fsSL https://raw.githubusercontent.com/sultan8898/homeabc/refs/heads/cursor/case-investigation-scripts-c2b2/install_case_tools.sh | bash' >&2
+    echo "Pipe the runner instead:" >&2
+    echo '  curl -fsSL https://raw.githubusercontent.com/sultan8898/homeabc/refs/heads/cursor/case-investigation-scripts-c2b2/case.sh | bash -s -- slice -a APP ...' >&2
     exit 1
 fi
 # shellcheck disable=SC1091

@@ -45,16 +45,13 @@ if ! CASE_TOOLS_DIR="$(case_tools_resolve_install_dir "$_CALLER_DIR")"; then
     cat >&2 <<'EOF'
 Could not find case_lib.sh.
 
-One-time install (downloads all tools to a case-tools folder):
+Ephemeral run (no permanent install):
+
+  curl -fsSL https://raw.githubusercontent.com/sultan8898/homeabc/refs/heads/cursor/case-investigation-scripts-c2b2/case.sh | bash -s -- triage 2000 YOUR_APP
+
+Or one-time install:
 
   curl -fsSL https://raw.githubusercontent.com/sultan8898/homeabc/refs/heads/cursor/case-investigation-scripts-c2b2/install_case_tools.sh | bash
-
-Then:
-
-  cd "$(case-tools path printed by installer)"
-  ./case_triage.sh 2000 afurtxebjn
-
-Do not run: curl .../case_slice.sh | bash
 EOF
     exit 1
 fi

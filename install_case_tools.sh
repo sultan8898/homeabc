@@ -46,6 +46,7 @@ FILES=(
 )
 
 echo "Installing to: $INSTALL_DIR"
+echo "(Or skip install: curl -fsSL ${RAW}/case.sh | bash -s -- help)"
 for f in "${FILES[@]}"; do
     echo "  -> $f"
     curl -fsSL "${RAW}/${f}" -o "$f"
