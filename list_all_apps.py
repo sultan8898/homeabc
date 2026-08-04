@@ -40,7 +40,7 @@ if sys.version_info < (3, 5):
 API_V2 = "https://api.cloudways.com/api/v2"
 API_V1 = "https://api.cloudways.com/api/v1"
 TOKEN_TTL = 3600
-SCRIPT_BUILD = "api-monitor-py35"
+SCRIPT_BUILD = "api-monitor-files-fix"
 
 _token_cache = {"token": None, "expires_at": None}
 
@@ -196,12 +196,79 @@ def server_monitor_summary(token, server_id, summary_type):
     return monitor_content_list(body), body
 
 
-def app_monitor_summary(token, server_id, app_id, summary_type):
-    code, body = api_get_v1(
-        token,
-        "/app/monitor/summary",
-        {"server_id": server_id, "app_id": app_id, "type": summary_type},
+def sum_content_mb(content):
+    """Sum folder lines from app monitor; prefer explicit total row."""
+    if not content:
+        return None
+    total = 0.0
+    found = False
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).lower()
+        mb = extract_size_mb(item.get("datapoint"))
+        if mb is None:
+            mb = extract_size_mb(item.get("value"))
+        if mb is None:
+            mb = extract_size_mb(item.get("usage"))
+        if mb is None:
+            mb = extract_size_mb(item.get("size"))
+        if mb is None:
+            continue
+        if name == "total" or name.endswith(" total") or "total" == name:
+            return mb
+        total += mb
+        found = True
+    return total if found else None
+
+
+def parse_files_mb_from_body(body):
+    """Parse app file / webroot size (MB) from assorted API response shapes."""
+    if body is None:
+        return None
+    if isinstance(body, (int, float)):
+        if not _looks_like_timestamp(body):
+            return float(body)
+        return None
+    if isinstance(body, list):
+        return sum_content_mb(body)
+    if not isinstance(body, dict):
+        return None
+
+    # Top-level numeric keys (webroot size, etc.)
+    file_keys = (
+        "webroot", "webfiles", "files", "app_disk", "application",
+        "disk_usage", "file_usage", "usage", "size", "value",
     )
+    total = 0.0
+    found = False
+    for k in file_keys:
+        v = body.get(k)
+        if isinstance(v, (int, float)) and not _looks_like_timestamp(v):
+            total += float(v)
+            found = True
+    if found:
+        return total
+
+    content = monitor_content_list(body)
+    if content:
+        mb = sum_content_mb(content)
+        if mb is not None:
+            return mb
+
+    for v in body.values():
+        if isinstance(v, (dict, list)):
+            mb = parse_files_mb_from_body(v)
+            if mb is not None:
+                return mb
+    return None
+
+
+def app_monitor_summary(token, server_id, app_id, summary_type):
+    params = {"server_id": server_id, "app_id": app_id}
+    if summary_type:
+        params["type"] = summary_type
+    code, body = api_get_v1(token, "/app/monitor/summary", params)
     if code != 200:
         return None, body
     return monitor_content_list(body), body
@@ -216,6 +283,8 @@ def apply_content_to_sizes(sizes, content, apps, field):
         if mb is None:
             mb = extract_size_mb(item.get("size"))
         if mb is None:
+            mb = extract_size_mb(item.get("value"))
+        if mb is None:
             continue
         su = match_app_sys_user(name, apps)
         if not su and len(apps) == 1:
@@ -226,41 +295,97 @@ def apply_content_to_sizes(sizes, content, apps, field):
         sizes[su][field] = format_mb_display(mb)
 
 
-def pick_app_monitor_size(content, apps):
-    """Single-app monitor/summary: take largest numeric datapoint or named total."""
-    if not content:
-        return None
-    best = None
-    for item in content:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("name", "")).lower()
-        mb = extract_size_mb(item.get("datapoint"))
+def fetch_app_files_mb(token, server_id, app_id, debug=False):
+    """Application web/files disk — not available on server/monitor/summary type=db."""
+    disk_paths = (
+        "/app/disk_usage",
+        "/app/manage/diskUsage",
+        "/app/monitor/diskUsage",
+        "/server/monitor/diskUsage",
+    )
+    for path in disk_paths:
+        code, body = api_get_v1(
+            token, path, {"server_id": server_id, "app_id": app_id},
+        )
+        if debug and code:
+            print("  [debug] {} {} -> {}".format(path, code, str(body)[:300]))
+        if code == 200:
+            mb = parse_files_mb_from_body(body)
+            if mb is not None:
+                return mb
+
+    file_types = (
+        "disk_usage", "webroot", "disk", "web", "files", "file",
+        "data", "usage", "application", "app",
+    )
+    for t in file_types:
+        content, body = app_monitor_summary(token, server_id, app_id, t)
+        mb = sum_content_mb(content) if content else None
         if mb is None:
-            continue
-        if "total" in name:
+            mb = parse_files_mb_from_body(body)
+        if mb is not None:
             return mb
-        if best is None or mb > best:
-            best = mb
-    return best
+        time.sleep(0.12)
+
+    # Without type param (some accounts)
+    content, body = app_monitor_summary(token, server_id, app_id, None)
+    mb = sum_content_mb(content) if content else None
+    if mb is None:
+        mb = parse_files_mb_from_body(body)
+    if mb is not None:
+        return mb
+
+    for target in ("disk_usage", "disk", "webroot", "web", "files", "file"):
+        code, body = api_get_v1(
+            token,
+            "/app/monitor/detail",
+            {
+                "server_id": server_id,
+                "app_id": app_id,
+                "target": target,
+                "duration": "24h",
+                "timezone": "UTC",
+            },
+        )
+        if code == 200:
+            mb = parse_files_mb_from_body(body)
+            if mb is not None:
+                return mb
+        time.sleep(0.1)
+    return None
+
+
+def pick_app_monitor_size(content, apps):
+    """Single value from monitor content (DB tables etc.)."""
+    mb = sum_content_mb(content)
+    if mb is not None:
+        return mb
+    return None
 
 
 def collect_sizes_api_for_server(token, server_id, apps):
     sizes = {}
     debug = os.environ.get("MONITOR_DEBUG", "").strip() == "1"
 
-    # Server-wide per-app lists (fast): type=db is DB disk per app; type=disk is app files.
-    for summary_type, field in (("db", "db_size"), ("disk", "files_size")):
+    # DB: server summary type=db (confirmed working for users).
+    content, raw = server_monitor_summary(token, server_id, "db")
+    if debug:
+        print("\n  [debug] server {} type=db sample: {}".format(
+            server_id, str(raw)[:400],
+        ))
+    if content:
+        apply_content_to_sizes(sizes, content, apps, "db_size")
+
+    # Files: try server-level types (often empty); real data is per-app.
+    for summary_type in ("disk", "data", "app", "files", "web", "application"):
         content, raw = server_monitor_summary(token, server_id, summary_type)
-        if debug:
-            print("\n  [debug] server {} type={} sample: {}".format(
-                server_id, summary_type, str(raw)[:500],
+        if debug and content:
+            print("  [debug] server {} type={} hits={}".format(
+                server_id, summary_type, len(content),
             ))
         if content:
-            apply_content_to_sizes(sizes, content, apps, field)
+            apply_content_to_sizes(sizes, content, apps, "files_size")
 
-    # Per-app fallback for missing columns
-    file_types = ("disk", "web", "files", "data")
     db_types = ("db", "mysql", "database")
 
     for app in apps:
@@ -271,13 +396,9 @@ def collect_sizes_api_for_server(token, server_id, apps):
         entry = sizes.setdefault(su, {})
 
         if not entry.get("files_size"):
-            for t in file_types:
-                content, _ = app_monitor_summary(token, server_id, app_id, t)
-                mb = pick_app_monitor_size(content, apps)
-                if mb is not None:
-                    entry["files_size"] = format_mb_display(mb)
-                    break
-                time.sleep(0.15)
+            mb = fetch_app_files_mb(token, server_id, app_id, debug=debug)
+            if mb is not None:
+                entry["files_size"] = format_mb_display(mb)
 
         if not entry.get("db_size"):
             for t in db_types:
@@ -286,7 +407,7 @@ def collect_sizes_api_for_server(token, server_id, apps):
                 if mb is not None:
                     entry["db_size"] = format_mb_display(mb)
                     break
-                time.sleep(0.15)
+                time.sleep(0.12)
 
         if not entry.get("files_size"):
             entry["files_size"] = "n/a"
