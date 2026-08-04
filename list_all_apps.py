@@ -6,8 +6,13 @@ Read-only. Lists every application on the account with per-app du -sch sizes.
 
 Requires Python 3.5+ (cw-proxy ships an older python3; this script avoids 3.6+ syntax).
 
-Usage on cw-proxy:
-    python3 <(curl -fsSL 'https://raw.githubusercontent.com/sultan8898/homeabc/cursor/cloudways-app-inventory-cng-71a8/list_all_apps.py')
+Stable raw URL (pin by commit; branch URL can lag on GitHub CDN):
+    python3 <(curl -fsSL 'https://raw.githubusercontent.com/sultan8898/homeabc/95a0eeb/list_all_apps.py')
+
+Or download then run (best if your terminal breaks long URLs):
+    curl -fsSL -o /tmp/list_all_apps.py \\
+      'https://raw.githubusercontent.com/sultan8898/homeabc/95a0eeb/list_all_apps.py'
+    python3 /tmp/list_all_apps.py
 """
 
 import base64
@@ -32,6 +37,7 @@ if sys.version_info < (3, 5):
 
 API_BASE = "https://api.cloudways.com/api/v2"
 TOKEN_TTL = 3600
+SCRIPT_BUILD = "py35-95a0eeb"
 
 _token_cache = {"token": None, "expires_at": None}
 
@@ -268,7 +274,7 @@ def collect_rows(servers, sizes_by_server):
 def main():
     print("=" * 60)
     print("  Cloudways Account App Inventory (v2 API, read-only)")
-    print("  Python {}".format(sys.version.split()[0]))
+    print("  Python {}  build {}".format(sys.version.split()[0], SCRIPT_BUILD))
     print("=" * 60)
 
     email = input("\nEmail address : ").strip()
