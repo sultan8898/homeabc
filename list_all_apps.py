@@ -40,7 +40,7 @@ if sys.version_info < (3, 5):
 API_V2 = "https://api.cloudways.com/api/v2"
 API_V1 = "https://api.cloudways.com/api/v1"
 TOKEN_TTL = 3600
-SCRIPT_BUILD = "api-monitor-apps-type"
+SCRIPT_BUILD = "api-db-is-files-du-mysql"
 
 _token_cache = {"token": None, "expires_at": None}
 
@@ -385,8 +385,11 @@ def pick_app_monitor_size(content, apps):
     return None
 
 
-def fill_missing_files_via_local_du(servers, sizes_by_server, local_sid):
-    """When monitor API has DB but not web/files, du on this host fills files_size."""
+def fill_missing_sizes_via_local_du(servers, sizes_by_server, local_sid):
+    """
+    On a Cloudways server: monitor type=db is app FILES, not MySQL.
+    Local du fills missing files_size and/or db_size (/var/lib/mysql/<db_name>).
+    """
     if not local_sid:
         return
     if os.environ.get("API_DU_FILL_LOCAL", "1").strip() in ("0", "no", "false"):
@@ -398,62 +401,57 @@ def fill_missing_files_via_local_du(servers, sizes_by_server, local_sid):
     if not server_sizes or server_sizes == "SKIPPED":
         return
     apps = target.get("apps", [])
-    missing = False
+    need_files = need_db = False
     for app in apps:
         su = str(app.get("sys_user", "")).strip()
         ent = server_sizes.get(su) or {}
         if ent.get("files_size") in (None, "", "n/a"):
-            missing = True
-            break
-    if not missing:
+            need_files = True
+        if ent.get("db_size") in (None, "", "n/a"):
+            need_db = True
+    if not need_files and not need_db:
         return
     print(
-        "\n  [api] Monitor API has no per-app file sizes for this account; "
-        "running local du -sch on server {} for files_size ...".format(local_sid)
+        "\n  [api] Filling missing sizes via local du on server {} "
+        "(files=app tree, db=/var/lib/mysql/<db_name>) ...".format(local_sid)
     )
     du_sizes = collect_sizes_local(apps)
     for su, du in du_sizes.items():
         if not server_sizes.get(su):
             server_sizes[su] = {}
-        if server_sizes[su].get("files_size") in (None, "", "n/a"):
+        if need_files and server_sizes[su].get("files_size") in (None, "", "n/a"):
             server_sizes[su]["files_size"] = du.get("files_size", "n/a")
-    print("    local du filled {} app(s)".format(len(du_sizes)))
+        if need_db and server_sizes[su].get("db_size") in (None, "", "n/a"):
+            server_sizes[su]["db_size"] = du.get("db_size", "n/a")
+    print("    local du updated {} app(s)".format(len(du_sizes)))
 
 
 def collect_sizes_api_for_server(token, server_id, apps):
     sizes = {}
     debug = os.environ.get("MONITOR_DEBUG", "").strip() == "1"
 
-    # DB: server/monitor/summary type=db (names are sys_user; item type often "apps").
+    # Cloudways monitor: type=db = per-app APPLICATION disk (files), names=sys_user.
+    # (type=disk on server summary returns bandwidth / type=bw — not files.)
     content, raw = server_monitor_summary(token, server_id, "db")
     if debug:
-        print("\n  [debug] server {} type=db sample: {}".format(
+        print("\n  [debug] server {} type=db (app FILES) sample: {}".format(
             server_id, str(raw)[:400],
         ))
     if content:
-        apply_content_to_sizes(sizes, content, apps, "db_size")
+        apply_content_to_sizes(sizes, content, apps, "files_size")
 
-    # Files: NOT type=disk (that returns bandwidth_monthly / type=bw).
-    # Try server-level per-app file metrics first (one call per server).
-    file_server_types = (
-        "apps", "app", "webroot", "web", "files", "file", "data",
-        "application", "webfiles", "disk_usage",
-    )
-    for summary_type in file_server_types:
+    # Real MySQL datadir sizes — try server summary types (often empty).
+    for summary_type in ("mysql", "database", "mysqldb", "dbase", "data"):
         content, raw = server_monitor_summary(token, server_id, summary_type)
         if not content or is_bandwidth_only_content(content):
-            if debug and content:
-                print("  [debug] server {} type={} skipped (bandwidth)".format(
-                    server_id, summary_type,
-                ))
             continue
         if debug:
-            print("  [debug] server {} type={} hits={} sample={}".format(
-                server_id, summary_type, len(content), str(raw)[:200],
+            print("  [debug] server {} type={} (DB) hits={}".format(
+                server_id, summary_type, len(content),
             ))
-        apply_content_to_sizes(sizes, content, apps, "files_size")
+        apply_content_to_sizes(sizes, content, apps, "db_size")
         if any(
-            sizes.get(str(a.get("sys_user", "")).strip(), {}).get("files_size")
+            sizes.get(str(a.get("sys_user", "")).strip(), {}).get("db_size")
             for a in apps
         ):
             break
@@ -690,7 +688,7 @@ def main():
     default_size = "2" if on_cw else "1"
 
     print("\nSize collection method:")
-    print("  1) api   -- monitor API files+DB all servers (no SSH; may lag ~24h)")
+    print("  1) api   -- files from monitor type=db; db from API or local du on this server")
     print("  2) local -- du -sch THIS server only")
     print("  3) cng   -- du all servers via cw-proxy cng <ip>")
     print("  4) ssh   -- du all servers via ssh root@public_ip")
@@ -713,8 +711,9 @@ def main():
     sizes_by_server = {}
 
     if size_mode == "api":
-        print("\n[2] Collecting file + DB sizes via v1 monitor API ...")
-        print("    (server/monitor/summary type=disk+db; per-app fallback if needed)")
+        print("\n[2] Collecting sizes via v1 monitor API ...")
+        print("    files: server/monitor/summary type=db (app disk; Cloudways naming)")
+        print("    db:    du /var/lib/mysql on this server if API has no MySQL metric")
         for srv in servers:
             sid = str(srv.get("id", ""))
             apps = srv.get("apps", [])
@@ -729,7 +728,7 @@ def main():
                 print("FAILED")
             time.sleep(0.35)
 
-        fill_missing_files_via_local_du(servers, sizes_by_server, local_sid)
+        fill_missing_sizes_via_local_du(servers, sizes_by_server, local_sid)
 
     elif size_mode == "local":
         if not local_sid:
