@@ -40,7 +40,7 @@ if sys.version_info < (3, 5):
 API_V2 = "https://api.cloudways.com/api/v2"
 API_V1 = "https://api.cloudways.com/api/v1"
 TOKEN_TTL = 3600
-SCRIPT_BUILD = "api-monitor-files-fix"
+SCRIPT_BUILD = "api-monitor-apps-type"
 
 _token_cache = {"token": None, "expires_at": None}
 
@@ -274,11 +274,27 @@ def app_monitor_summary(token, server_id, app_id, summary_type):
     return monitor_content_list(body), body
 
 
+def is_bandwidth_only_content(content):
+    """server/monitor/summary type=disk often returns bw, not app files."""
+    if not content:
+        return False
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        t = str(item.get("type", "")).lower()
+        name = str(item.get("name", "")).lower()
+        if t == "bw" or "bandwidth" in name:
+            return True
+    return False
+
+
 def apply_content_to_sizes(sizes, content, apps, field):
     for item in content or []:
         if not isinstance(item, dict):
             continue
-        name = item.get("name") or item.get("label") or item.get("sys_user") or ""
+        name = str(
+            item.get("name") or item.get("label") or item.get("sys_user") or ""
+        ).strip()
         mb = extract_size_mb(item.get("datapoint"))
         if mb is None:
             mb = extract_size_mb(item.get("size"))
@@ -286,7 +302,13 @@ def apply_content_to_sizes(sizes, content, apps, field):
             mb = extract_size_mb(item.get("value"))
         if mb is None:
             continue
-        su = match_app_sys_user(name, apps)
+        su = ""
+        for app in apps:
+            if name == str(app.get("sys_user", "")).strip():
+                su = name
+                break
+        if not su:
+            su = match_app_sys_user(name, apps)
         if not su and len(apps) == 1:
             su = str(apps[0].get("sys_user", "")).strip()
         if not su:
@@ -315,7 +337,7 @@ def fetch_app_files_mb(token, server_id, app_id, debug=False):
                 return mb
 
     file_types = (
-        "disk_usage", "webroot", "disk", "web", "files", "file",
+        "apps", "disk_usage", "webroot", "disk", "web", "files", "file",
         "data", "usage", "application", "app",
     )
     for t in file_types:
@@ -363,11 +385,46 @@ def pick_app_monitor_size(content, apps):
     return None
 
 
+def fill_missing_files_via_local_du(servers, sizes_by_server, local_sid):
+    """When monitor API has DB but not web/files, du on this host fills files_size."""
+    if not local_sid:
+        return
+    if os.environ.get("API_DU_FILL_LOCAL", "1").strip() in ("0", "no", "false"):
+        return
+    target = next((s for s in servers if str(s.get("id")) == local_sid), None)
+    if not target:
+        return
+    server_sizes = sizes_by_server.get(local_sid)
+    if not server_sizes or server_sizes == "SKIPPED":
+        return
+    apps = target.get("apps", [])
+    missing = False
+    for app in apps:
+        su = str(app.get("sys_user", "")).strip()
+        ent = server_sizes.get(su) or {}
+        if ent.get("files_size") in (None, "", "n/a"):
+            missing = True
+            break
+    if not missing:
+        return
+    print(
+        "\n  [api] Monitor API has no per-app file sizes for this account; "
+        "running local du -sch on server {} for files_size ...".format(local_sid)
+    )
+    du_sizes = collect_sizes_local(apps)
+    for su, du in du_sizes.items():
+        if not server_sizes.get(su):
+            server_sizes[su] = {}
+        if server_sizes[su].get("files_size") in (None, "", "n/a"):
+            server_sizes[su]["files_size"] = du.get("files_size", "n/a")
+    print("    local du filled {} app(s)".format(len(du_sizes)))
+
+
 def collect_sizes_api_for_server(token, server_id, apps):
     sizes = {}
     debug = os.environ.get("MONITOR_DEBUG", "").strip() == "1"
 
-    # DB: server summary type=db (confirmed working for users).
+    # DB: server/monitor/summary type=db (names are sys_user; item type often "apps").
     content, raw = server_monitor_summary(token, server_id, "db")
     if debug:
         print("\n  [debug] server {} type=db sample: {}".format(
@@ -376,15 +433,30 @@ def collect_sizes_api_for_server(token, server_id, apps):
     if content:
         apply_content_to_sizes(sizes, content, apps, "db_size")
 
-    # Files: try server-level types (often empty); real data is per-app.
-    for summary_type in ("disk", "data", "app", "files", "web", "application"):
+    # Files: NOT type=disk (that returns bandwidth_monthly / type=bw).
+    # Try server-level per-app file metrics first (one call per server).
+    file_server_types = (
+        "apps", "app", "webroot", "web", "files", "file", "data",
+        "application", "webfiles", "disk_usage",
+    )
+    for summary_type in file_server_types:
         content, raw = server_monitor_summary(token, server_id, summary_type)
-        if debug and content:
-            print("  [debug] server {} type={} hits={}".format(
-                server_id, summary_type, len(content),
+        if not content or is_bandwidth_only_content(content):
+            if debug and content:
+                print("  [debug] server {} type={} skipped (bandwidth)".format(
+                    server_id, summary_type,
+                ))
+            continue
+        if debug:
+            print("  [debug] server {} type={} hits={} sample={}".format(
+                server_id, summary_type, len(content), str(raw)[:200],
             ))
-        if content:
-            apply_content_to_sizes(sizes, content, apps, "files_size")
+        apply_content_to_sizes(sizes, content, apps, "files_size")
+        if any(
+            sizes.get(str(a.get("sys_user", "")).strip(), {}).get("files_size")
+            for a in apps
+        ):
+            break
 
     db_types = ("db", "mysql", "database")
 
@@ -656,6 +728,8 @@ def main():
                 sizes_by_server[sid] = None
                 print("FAILED")
             time.sleep(0.35)
+
+        fill_missing_files_via_local_du(servers, sizes_by_server, local_sid)
 
     elif size_mode == "local":
         if not local_sid:
