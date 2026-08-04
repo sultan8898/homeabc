@@ -233,6 +233,27 @@ def server_location(srv: dict) -> str:
     return provider or region or "n/a"
 
 
+def parse_size_mode(choice: str, default_digit: str, on_cloudways_server: bool) -> str:
+    """Map menu input (digit or name) to size mode; avoid falling through to cng by mistake."""
+    c = choice.strip().lower()
+    if not c:
+        c = default_digit
+    by_name = {
+        "local": "local",
+        "cng": "cng",
+        "ssh": "ssh",
+        "skip": "skip",
+    }
+    by_digit = {"1": "local", "2": "cng", "3": "ssh", "4": "skip"}
+    if c in by_name:
+        return by_name[c]
+    if c in by_digit:
+        return by_digit[c]
+    if on_cloudways_server:
+        return "local"
+    return "cng"
+
+
 def collect_rows(servers: list, sizes_by_server: dict) -> list:
     rows = []
     for srv in servers:
@@ -286,15 +307,33 @@ def main():
     print(f"    {len(servers)} server(s) found.")
 
     local_sid = detect_local_server_id()
-    default_size = "1" if local_sid else "2"
+    on_cw = bool(local_sid)
+    # On a single CW server, default local; on cw-proxy default cng.
+    default_size = "1" if on_cw else "2"
     print("\nSize collection method:")
-    print("  1) local -- du on THIS server only (run as root on a Cloudways server)")
-    print("  2) cng   -- from cw-proxy: cng <server_ip> per server (recommended on proxy)")
-    print("  3) ssh   -- ssh root@<public_ip> per server")
+    print("  1) local -- du on THIS server only (other servers: unavailable in CSV)")
+    print("  2) cng   -- ALL servers via cw-proxy: cng <server_ip> (not on app servers)")
+    print("  3) ssh   -- ALL servers: ssh root@<public_ip> each (cw-proxy or fleet SSH)")
     print("  4) skip")
-    choice = input(f"Choose [{default_size}] : ").strip() or default_size
+    if on_cw:
+        print(
+            f"\n  Note: you are on Cloudways server id {local_sid}. "
+            "Option 1 only runs du here. For all {n} servers, use cw-proxy (cng) "
+            "or option 3 ssh if this host can reach every server IP.".format(
+                n=len(servers),
+            )
+        )
+    choice = input(f"Choose [{default_size}] (1-4 or local/cng/ssh/skip) : ").strip()
 
-    size_mode = {"1": "local", "2": "cng", "3": "ssh", "4": "skip"}.get(choice, "cng")
+    size_mode = parse_size_mode(choice, default_size, on_cw)
+    if size_mode == "cng" and not shutil.which("cng"):
+        print(
+            "[ERROR] `cng` is not on this host (expected on cw-proxy, not on app servers).\n"
+            "  - All servers: SSH to cw-proxy and run again, choose cng (2).\n"
+            "  - This server only: choose local (1).\n"
+            "  - All servers from here: choose ssh (3) if root SSH to each public_ip works."
+        )
+        sys.exit(1)
     sizes_by_server: dict = {}
 
     if size_mode == "local":
@@ -319,9 +358,6 @@ def main():
         if size_mode == "ssh":
             ssh_user = input("SSH user [root] : ").strip() or "root"
         if size_mode == "cng":
-            if not shutil.which("cng"):
-                print("[ERROR] `cng` not found in PATH. Run this from cw-proxy or use ssh mode.")
-                sys.exit(1)
             cng_prefix = (
                 os.environ.get("CNG_CMD", "").strip()
                 or input("Cng command [cng] : ").strip()
