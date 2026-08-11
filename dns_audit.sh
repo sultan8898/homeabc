@@ -25,17 +25,29 @@
 #   --api-key      Cloudways API key (or set CW_API_KEY)
 #   --local-only   Only parse /home/master/applications (default on server)
 #   --csv          Tab-separated output (domain, host, type, value, note)
-#   --server-ip    Override expected A-record IP (default: api.ipify.org)
+#   --server-ip    Override expected A-record IP (local mode only)
+#   --securitytrails | --st   Use SecurityTrails API for apex DNS records
+#   --st-api-key   SecurityTrails API key (or ST_API_KEY env)
+#   --st-subdomains  Also list known subdomains (1 extra API call per domain)
+#   --source       dig | securitytrails | both  (default: dig)
+#   --domain       Audit one domain only (skip Cloudways/local discovery)
+#   --limit N      Only audit first N domains (API quota safety)
 # =============================================================================
 
 set -euo pipefail
 
 API_BASE="https://api.cloudways.com/api/v2"
+ST_API_BASE="https://api.securitytrails.com/v1"
 USE_API=0
 CSV=0
 LOCAL=1
 SERVER_IP=""
 BASE_DIR="/home/master/applications"
+DNS_SOURCE="dig"
+ST_SUBDOMAINS=0
+ST_SLEEP="${ST_SLEEP:-0.6}"
+DOMAIN_LIMIT=0
+SINGLE_DOMAIN=""
 
 # Common hostnames to probe (add more in EXTRA_HOSTS env, space-separated)
 COMMON_HOSTS="www mail smtp pop pop3 imap webmail ftp cpanel autodiscover autoconfig _dmarc"
@@ -49,8 +61,14 @@ while [[ $# -gt 0 ]]; do
         --local-only) LOCAL=1; USE_API=0; shift ;;
         --csv) CSV=1; shift ;;
         --server-ip) SERVER_IP="$2"; shift 2 ;;
+        --securitytrails|--st) DNS_SOURCE="securitytrails"; shift ;;
+        --st-api-key) ST_API_KEY="$2"; shift 2 ;;
+        --st-subdomains) ST_SUBDOMAINS=1; shift ;;
+        --source) DNS_SOURCE="$2"; shift 2 ;;
+        --domain) SINGLE_DOMAIN="$2"; shift 2 ;;
+        --limit) DOMAIN_LIMIT="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -58,6 +76,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 command -v dig >/dev/null 2>&1 || { echo "dig is required (install dnsutils)." >&2; exit 1; }
+
+case "$DNS_SOURCE" in
+    dig|securitytrails|both) ;;
+    *) echo "Invalid --source: $DNS_SOURCE (use dig, securitytrails, or both)" >&2; exit 1 ;;
+esac
+
+if [[ "$DNS_SOURCE" != "dig" ]]; then
+    command -v jq >/dev/null 2>&1 || { echo "jq is required for SecurityTrails mode." >&2; exit 1; }
+    [[ -n "${ST_API_KEY:-}" ]] || {
+        echo "Set ST_API_KEY or pass --st-api-key for SecurityTrails mode." >&2
+        exit 1
+    }
+fi
 
 # Only compare A records to this machine's IP in local (single-server) mode.
 # Account-wide --api spans many servers; pass --server-ip to enable checks.
@@ -140,18 +171,92 @@ collect_api_domains() {
 }
 
 csv_row() {
-    printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6"
+}
+
+emit_row() {
+    local apex="$1" host="$2" rrtype="$3" val="$4" note="${5:-}" source="${6:-dig}"
+    if [[ "$CSV" -eq 1 ]]; then
+        csv_row "$apex" "$host" "$rrtype" "$val" "$note" "$source"
+    else
+        if [[ -n "$note" ]]; then
+            printf "  %-6s %-40s %s  [%s] (%s)\n" "$rrtype" "$host" "$val" "$note" "$source"
+        else
+            printf "  %-6s %-40s %s (%s)\n" "$rrtype" "$host" "$val" "$source"
+        fi
+    fi
 }
 
 print_header() {
     if [[ "$CSV" -eq 1 ]]; then
-        csv_row "apex_domain" "host" "type" "value" "note"
+        csv_row "apex_domain" "host" "type" "value" "note" "source"
     else
         echo "================================================================"
         echo "DNS AUDIT — $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "DNS source: $DNS_SOURCE"
         [[ -n "$SERVER_IP" ]] && echo "Expected server A record IP: $SERVER_IP"
         echo "================================================================"
     fi
+}
+
+st_api_get() {
+    local path="$1"
+    curl -fsS --max-time 45 \
+        -H "APIKEY: ${ST_API_KEY}" \
+        -H "Accept: application/json" \
+        "${ST_API_BASE}${path}"
+}
+
+st_audit_domain() {
+    local apex="$1"
+    local json err
+
+    if ! json=$(st_api_get "/domain/${apex}" 2>&1); then
+        echo "# SecurityTrails error for $apex: $json" >&2
+        return 0
+    fi
+
+    if echo "$json" | jq -e '.message' >/dev/null 2>&1; then
+        echo "# SecurityTrails: $(echo "$json" | jq -r '.message') ($apex)" >&2
+        return 0
+    fi
+
+    local qname="$apex"
+    while IFS= read -r val; do
+        [[ -n "$val" ]] && emit_row "$apex" "$qname" "A" "$val" "" "securitytrails"
+    done < <(echo "$json" | jq -r '.current_dns.a.values[]?.ip // empty')
+
+    while IFS= read -r val; do
+        [[ -n "$val" ]] && emit_row "$apex" "$qname" "AAAA" "$val" "" "securitytrails"
+    done < <(echo "$json" | jq -r '.current_dns.aaaa.values[]?.ip // empty')
+
+    while IFS= read -r val; do
+        [[ -n "$val" ]] && emit_row "$apex" "$qname" "MX" "$val" "" "securitytrails"
+    done < <(echo "$json" | jq -r '.current_dns.mx.values[]? | "\(.priority) \(.host)"')
+
+    while IFS= read -r val; do
+        [[ -n "$val" ]] && emit_row "$apex" "$qname" "NS" "$val" "" "securitytrails"
+    done < <(echo "$json" | jq -r '.current_dns.ns.values[]?.nameserver // empty')
+
+    while IFS= read -r val; do
+        [[ -n "$val" ]] && emit_row "$apex" "$qname" "SOA" "$val" "" "securitytrails"
+    done < <(echo "$json" | jq -r '.current_dns.soa.values[]? | "ttl=\(.ttl) rname=\(.email)"')
+
+    while IFS= read -r val; do
+        [[ -n "$val" ]] && emit_row "$apex" "$qname" "TXT" "$val" "" "securitytrails"
+    done < <(echo "$json" | jq -r '.current_dns.txt.values[]?.value // empty')
+
+    if [[ "$ST_SUBDOMAINS" -eq 1 ]]; then
+        sleep "$ST_SLEEP"
+        local subs
+        if subs=$(st_api_get "/domain/${apex}/subdomains" 2>/dev/null); then
+            while IFS= read -r sub; do
+                [[ -n "$sub" ]] && emit_row "$apex" "${sub}.${apex}" "SUBDOMAIN" "(known)" "" "securitytrails"
+            done < <(echo "$subs" | jq -r '.subdomains[]? // empty')
+        fi
+    fi
+
+    sleep "$ST_SLEEP"
 }
 
 # Query one name for one RR type; print rows
@@ -170,12 +275,12 @@ dig_query() {
             note="A does not match server IP ($SERVER_IP)"
         fi
         if [[ "$CSV" -eq 1 ]]; then
-            csv_row "$apex" "$host" "$rrtype" "$val" "$note"
+            csv_row "$apex" "$host" "$rrtype" "$val" "$note" "dig"
         else
             if [[ -n "$note" ]]; then
-                printf "  %-6s %-40s %s  [%s]\n" "$rrtype" "$qname" "$val" "$note"
+                printf "  %-6s %-40s %s  [%s] (dig)\n" "$rrtype" "$qname" "$val" "$note"
             else
-                printf "  %-6s %-40s %s\n" "$rrtype" "$qname" "$val"
+                printf "  %-6s %-40s %s (dig)\n" "$rrtype" "$qname" "$val"
             fi
         fi
     done <<< "$out"
@@ -190,9 +295,9 @@ dig_srv() {
     [[ -z "$out" ]] && return 0
     while IFS= read -r val; do
         if [[ "$CSV" -eq 1 ]]; then
-            csv_row "$apex" "$service" "SRV" "$val" ""
+            csv_row "$apex" "$service" "SRV" "$val" "" "dig"
         else
-            printf "  %-6s %-40s %s\n" "SRV" "$qname" "$val"
+            printf "  %-6s %-40s %s (dig)\n" "SRV" "$qname" "$val"
         fi
     done <<< "$out"
 }
@@ -202,58 +307,71 @@ audit_domain() {
     if [[ "$CSV" -eq 0 ]]; then
         echo ""
         echo "--- $apex ---"
-        echo "  Nameservers:"
     fi
 
-    dig_query "$apex" "@" NS
-    dig_query "$apex" "@" SOA
-    dig_query "$apex" "@" A
-    dig_query "$apex" "@" AAAA
-    dig_query "$apex" "@" MX
-    dig_query "$apex" "@" TXT
-    dig_query "$apex" "@" CNAME
+    if [[ "$DNS_SOURCE" == "securitytrails" || "$DNS_SOURCE" == "both" ]]; then
+        [[ "$CSV" -eq 0 ]] && echo "  SecurityTrails (apex):"
+        st_audit_domain "$apex"
+    fi
 
-    # Common subdomains
-    for h in $COMMON_HOSTS $EXTRA_HOSTS; do
-        if [[ "$h" == _dmarc ]]; then
-            dig_query "$apex" "_dmarc" TXT
-            continue
+    if [[ "$DNS_SOURCE" == "dig" || "$DNS_SOURCE" == "both" ]]; then
+        if [[ "$CSV" -eq 0 ]]; then
+            echo "  dig:"
+            echo "  Nameservers:"
         fi
-        dig_query "$apex" "$h" A
-        dig_query "$apex" "$h" AAAA
-        dig_query "$apex" "$h" CNAME
-    done
 
-    # Common SRV mail discovery
-    for srv in _imap._tcp _pop3._tcp _smtp._tcp _submission._tcp _autodiscover._tcp; do
-        dig_srv "$apex" "$srv"
-    done
+        dig_query "$apex" "@" NS
+        dig_query "$apex" "@" SOA
+        dig_query "$apex" "@" A
+        dig_query "$apex" "@" AAAA
+        dig_query "$apex" "@" MX
+        dig_query "$apex" "@" TXT
+        dig_query "$apex" "@" CNAME
 
-    # Pointing check (local single-server mode only)
-    if [[ -n "$SERVER_IP" && "$CSV" -eq 0 ]]; then
-        local root_ip www_ip
-        root_ip=$(dig +short A "$apex" 2>/dev/null | head -n1)
-        www_ip=$(dig +short A "www.${apex}" 2>/dev/null | head -n1)
-        if [[ -z "$root_ip" ]]; then
-            echo "  CHECK: $apex has no A record"
-        elif [[ "$root_ip" != "$SERVER_IP" ]]; then
-            echo "  CHECK: $apex A=$root_ip (expected $SERVER_IP)"
-        fi
-        if [[ -z "$www_ip" ]]; then
-            echo "  CHECK: www.$apex has no A record"
-        elif [[ "$www_ip" != "$SERVER_IP" ]]; then
-            echo "  CHECK: www.$apex A=$www_ip (expected $SERVER_IP)"
+        # Common subdomains
+        for h in $COMMON_HOSTS $EXTRA_HOSTS; do
+            if [[ "$h" == _dmarc ]]; then
+                dig_query "$apex" "_dmarc" TXT
+                continue
+            fi
+            dig_query "$apex" "$h" A
+            dig_query "$apex" "$h" AAAA
+            dig_query "$apex" "$h" CNAME
+        done
+
+        # Common SRV mail discovery
+        for srv in _imap._tcp _pop3._tcp _smtp._tcp _submission._tcp _autodiscover._tcp; do
+            dig_srv "$apex" "$srv"
+        done
+
+        # Pointing check (local single-server mode only)
+        if [[ -n "$SERVER_IP" && "$CSV" -eq 0 ]]; then
+            local root_ip www_ip
+            root_ip=$(dig +short A "$apex" 2>/dev/null | head -n1)
+            www_ip=$(dig +short A "www.${apex}" 2>/dev/null | head -n1)
+            if [[ -z "$root_ip" ]]; then
+                echo "  CHECK: $apex has no A record"
+            elif [[ "$root_ip" != "$SERVER_IP" ]]; then
+                echo "  CHECK: $apex A=$root_ip (expected $SERVER_IP)"
+            fi
+            if [[ -z "$www_ip" ]]; then
+                echo "  CHECK: www.$apex has no A record"
+            elif [[ "$www_ip" != "$SERVER_IP" ]]; then
+                echo "  CHECK: www.$apex A=$www_ip (expected $SERVER_IP)"
+            fi
         fi
     fi
 }
 
 # --- Main ---
-if [[ "$USE_API" -eq 1 ]]; then
+if [[ -n "$SINGLE_DOMAIN" ]]; then
+    add_domain "$SINGLE_DOMAIN"
+elif [[ "$USE_API" -eq 1 ]]; then
     collect_api_domains
 elif [[ "$LOCAL" -eq 1 && -d "$BASE_DIR" ]]; then
     collect_local_domains
 else
-    echo "No domains found. Run on a Cloudways server or use --api with CW_EMAIL/CW_API_KEY." >&2
+    echo "No domains found. Use --domain, --api, or run on a Cloudways server." >&2
     exit 1
 fi
 
@@ -264,9 +382,11 @@ fi
 
 print_header
 total=${#DOMAIN_LIST[@]}
+[[ "$DOMAIN_LIMIT" -gt 0 && "$DOMAIN_LIMIT" -lt "$total" ]] && total="$DOMAIN_LIMIT"
 n=0
 for d in "${DOMAIN_LIST[@]}"; do
     n=$((n + 1))
+    [[ "$DOMAIN_LIMIT" -gt 0 && "$n" -gt "$DOMAIN_LIMIT" ]] && break
     if [[ "$CSV" -eq 0 ]]; then
         echo "# [$n/$total] $d" >&2
     fi
@@ -275,7 +395,7 @@ done
 
 if [[ "$CSV" -eq 0 ]]; then
     echo ""
-    echo "Done. ${#DOMAIN_LIST[@]} domain(s) audited."
-    echo "Note: This lists public DNS answers, not a full zone export."
-    echo "For ALL records in a Cloudways DNS Made Easy zone, use DNS Made Easy API."
+    echo "Done. $n domain(s) audited."
+    echo "Note: SecurityTrails returns apex DNS + optional subdomain names (not full zone)."
+    echo "dig probes common hostnames; neither is a complete zone export."
 fi
