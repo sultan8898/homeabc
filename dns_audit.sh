@@ -14,10 +14,15 @@
 #   export CW_EMAIL='you@example.com'
 #   export CW_API_KEY='your-api-key'
 #   ./dns_audit.sh --api
-#   ./dns_audit.sh --api --csv
+#
+#   # One-liner (credentials as flags — works with pipe to bash):
+#   curl -fsSL .../dns_audit.sh | bash -s -- --api \
+#     --email 'you@example.com' --api-key 'your-api-key'
 #
 # Options:
 #   --api          Fetch domains from Cloudways API v2 (all servers in account)
+#   --email        Cloudways account email (or set CW_EMAIL)
+#   --api-key      Cloudways API key (or set CW_API_KEY)
 #   --local-only   Only parse /home/master/applications (default on server)
 #   --csv          Tab-separated output (domain, host, type, value, note)
 #   --server-ip    Override expected A-record IP (default: api.ipify.org)
@@ -39,11 +44,13 @@ EXTRA_HOSTS="${EXTRA_HOSTS:-}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --api) USE_API=1; shift ;;
+        --email) CW_EMAIL="$2"; shift 2 ;;
+        --api-key) CW_API_KEY="$2"; shift 2 ;;
         --local-only) LOCAL=1; USE_API=0; shift ;;
         --csv) CSV=1; shift ;;
         --server-ip) SERVER_IP="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -95,7 +102,8 @@ collect_local_domains() {
 # --- Cloudways API v2: domains from all servers/apps ---
 api_token() {
     [[ -n "${CW_EMAIL:-}" && -n "${CW_API_KEY:-}" ]] || {
-        echo "Set CW_EMAIL and CW_API_KEY for --api mode." >&2
+        echo "Set CW_EMAIL and CW_API_KEY (export) or pass --email and --api-key." >&2
+        echo "Note: VAR=value before curl does NOT reach 'bash' in a pipe — use export or flags." >&2
         exit 1
     }
     command -v jq >/dev/null 2>&1 || { echo "jq is required for --api mode." >&2; exit 1; }
