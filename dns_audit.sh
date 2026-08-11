@@ -59,7 +59,9 @@ done
 
 command -v dig >/dev/null 2>&1 || { echo "dig is required (install dnsutils)." >&2; exit 1; }
 
-if [[ -z "$SERVER_IP" ]]; then
+# Only compare A records to this machine's IP in local (single-server) mode.
+# Account-wide --api spans many servers; pass --server-ip to enable checks.
+if [[ -z "$SERVER_IP" && "$USE_API" -eq 0 ]]; then
     SERVER_IP=$(curl -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)
 fi
 
@@ -213,7 +215,6 @@ audit_domain() {
 
     # Common subdomains
     for h in $COMMON_HOSTS $EXTRA_HOSTS; do
-        [[ "$h" == _dmarc ]] && local dmarc_host="_dmarc" || dmarc_host="$h"
         if [[ "$h" == _dmarc ]]; then
             dig_query "$apex" "_dmarc" TXT
             continue
@@ -228,17 +229,21 @@ audit_domain() {
         dig_srv "$apex" "$srv"
     done
 
-    # Pointing check (legacy behaviour from original script)
+    # Pointing check (local single-server mode only)
     if [[ -n "$SERVER_IP" && "$CSV" -eq 0 ]]; then
         local root_ip www_ip
         root_ip=$(dig +short A "$apex" 2>/dev/null | head -n1)
         www_ip=$(dig +short A "www.${apex}" 2>/dev/null | head -n1)
-        [[ -z "$root_ip" ]] && echo "  CHECK: $apex has no A record"
-        [[ -n "$root_ip" && "$root_ip" != "$SERVER_IP" ]] && \
+        if [[ -z "$root_ip" ]]; then
+            echo "  CHECK: $apex has no A record"
+        elif [[ "$root_ip" != "$SERVER_IP" ]]; then
             echo "  CHECK: $apex A=$root_ip (expected $SERVER_IP)"
-        [[ -z "$www_ip" ]] && echo "  CHECK: www.$apex has no A record"
-        [[ -n "$www_ip" && "$www_ip" != "$SERVER_IP" ]] && \
+        fi
+        if [[ -z "$www_ip" ]]; then
+            echo "  CHECK: www.$apex has no A record"
+        elif [[ "$www_ip" != "$SERVER_IP" ]]; then
             echo "  CHECK: www.$apex A=$www_ip (expected $SERVER_IP)"
+        fi
     fi
 }
 
@@ -258,7 +263,13 @@ if [[ ${#DOMAIN_LIST[@]} -eq 0 ]]; then
 fi
 
 print_header
+total=${#DOMAIN_LIST[@]}
+n=0
 for d in "${DOMAIN_LIST[@]}"; do
+    n=$((n + 1))
+    if [[ "$CSV" -eq 0 ]]; then
+        echo "# [$n/$total] $d" >&2
+    fi
     audit_domain "$d"
 done
 
