@@ -90,9 +90,8 @@ if [[ "$DNS_SOURCE" != "dig" ]]; then
     }
 fi
 
-# Only compare A records to this machine's IP in local (single-server) mode.
-# Account-wide --api spans many servers; pass --server-ip to enable checks.
-if [[ -z "$SERVER_IP" && "$USE_API" -eq 0 ]]; then
+# Only compare A records to this machine's IP in local dig mode (not --api / not ST-only).
+if [[ -z "$SERVER_IP" && "$USE_API" -eq 0 && "$DNS_SOURCE" != "securitytrails" ]]; then
     SERVER_IP=$(curl -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)
 fi
 
