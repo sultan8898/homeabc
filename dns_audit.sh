@@ -32,6 +32,7 @@
 #   --source       dig | securitytrails | both  (default: dig)
 #   --domain       Audit one domain only (skip Cloudways/local discovery)
 #   --limit N      Only audit first N domains (API quota safety)
+#   --st-sleep S   Seconds between SecurityTrails calls (default: 2.5 with --api)
 # =============================================================================
 
 set -euo pipefail
@@ -45,9 +46,10 @@ SERVER_IP=""
 BASE_DIR="/home/master/applications"
 DNS_SOURCE="dig"
 ST_SUBDOMAINS=0
-ST_SLEEP="${ST_SLEEP:-0.6}"
+ST_SLEEP=""          # set after arg parse when empty
 DOMAIN_LIMIT=0
 SINGLE_DOMAIN=""
+declare -A ST_QUERIED
 
 # Common hostnames to probe (add more in EXTRA_HOSTS env, space-separated)
 COMMON_HOSTS="www mail smtp pop pop3 imap webmail ftp cpanel autodiscover autoconfig _dmarc"
@@ -67,6 +69,7 @@ while [[ $# -gt 0 ]]; do
         --source) DNS_SOURCE="$2"; shift 2 ;;
         --domain) SINGLE_DOMAIN="$2"; shift 2 ;;
         --limit) DOMAIN_LIMIT="$2"; shift 2 ;;
+        --st-sleep) ST_SLEEP="$2"; shift 2 ;;
         -h|--help)
             sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -88,6 +91,9 @@ if [[ "$DNS_SOURCE" != "dig" ]]; then
         echo "Set ST_API_KEY or pass --st-api-key for SecurityTrails mode." >&2
         exit 1
     }
+    if [[ -z "$ST_SLEEP" ]]; then
+        ST_SLEEP=$([[ "$USE_API" -eq 1 ]] && echo "2.5" || echo "1")
+    fi
 fi
 
 # Only compare A records to this machine's IP in local dig mode (not --api / not ST-only).
@@ -105,6 +111,7 @@ add_domain() {
     [[ -z "$d" ]] && return 0
     [[ "$d" == *cloudwaysapps.com ]] && return 0
     [[ "$d" == _* ]] && return 0
+    [[ "$d" == *"*"* ]] && return 0
     if [[ -z "${SEEN_DOMAINS[$d]:-}" ]]; then
         SEEN_DOMAINS[$d]=1
         DOMAIN_LIST+=("$d")
@@ -198,22 +205,84 @@ print_header() {
     fi
 }
 
+st_urlencode() {
+    jq -nr --arg s "$1" '$s|@uri'
+}
+
 st_api_get() {
     local path="$1"
-    curl -fsS --max-time 45 \
-        -H "APIKEY: ${ST_API_KEY}" \
-        -H "Accept: application/json" \
-        "${ST_API_BASE}${path}"
+    local attempt=0 max_attempts=6 wait=30
+    local url body code
+
+    url="${ST_API_BASE}${path}"
+    while [[ "$attempt" -lt "$max_attempts" ]]; do
+        body=$(curl -sS --max-time 45 -w $'\n__HTTP_CODE__:%{http_code}' \
+            -H "APIKEY: ${ST_API_KEY}" \
+            -H "Accept: application/json" \
+            "$url" 2>&1) || true
+
+        code="${body##*$'\n__HTTP_CODE__:'}"
+        body="${body%$'\n__HTTP_CODE__:'*}"
+
+        case "$code" in
+            200)
+                echo "$body"
+                return 0
+                ;;
+            404)
+                echo "# SecurityTrails: not found ($path)" >&2
+                return 1
+                ;;
+            429)
+                attempt=$((attempt + 1))
+                echo "# SecurityTrails: rate limit (429) — waiting ${wait}s (attempt ${attempt}/${max_attempts})" >&2
+                sleep "$wait"
+                wait=$((wait < 120 ? wait * 2 : 120))
+                ;;
+            *)
+                echo "# SecurityTrails: HTTP ${code} for $path" >&2
+                return 1
+                ;;
+        esac
+    done
+    echo "# SecurityTrails: gave up after rate limits for $path" >&2
+    return 1
+}
+
+st_mark_queried() {
+    local apex="$1"
+    ST_QUERIED[$apex]=1
+    if [[ "$apex" != www.* ]]; then
+        ST_QUERIED["www.${apex}"]=1
+    fi
+}
+
+st_skip_query() {
+    local apex="$1"
+    [[ "$apex" == *"*"* ]] && return 0
+    [[ -n "${ST_QUERIED[$apex]:-}" ]] && return 0
+    if [[ "$apex" == www.* ]]; then
+        local bare="${apex#www.}"
+        [[ -n "${ST_QUERIED[$bare]:-}" ]] && return 0
+    fi
+    return 1
 }
 
 st_audit_domain() {
     local apex="$1"
-    local json err
+    local json encoded
 
-    if ! json=$(st_api_get "/domain/${apex}" 2>&1); then
-        echo "# SecurityTrails error for $apex: $json" >&2
+    if st_skip_query "$apex"; then
+        echo "# SecurityTrails: skip duplicate $apex" >&2
         return 0
     fi
+
+    encoded=$(st_urlencode "$apex")
+    if ! json=$(st_api_get "/domain/${encoded}"); then
+        return 0
+    fi
+
+    st_mark_queried "$apex"
 
     if echo "$json" | jq -e '.message' >/dev/null 2>&1; then
         echo "# SecurityTrails: $(echo "$json" | jq -r '.message') ($apex)" >&2
@@ -248,7 +317,7 @@ st_audit_domain() {
     if [[ "$ST_SUBDOMAINS" -eq 1 ]]; then
         sleep "$ST_SLEEP"
         local subs
-        if subs=$(st_api_get "/domain/${apex}/subdomains" 2>/dev/null); then
+        if subs=$(st_api_get "/domain/${encoded}/subdomains"); then
             while IFS= read -r sub; do
                 [[ -n "$sub" ]] && emit_row "$apex" "${sub}.${apex}" "SUBDOMAIN" "(known)" "" "securitytrails"
             done < <(echo "$subs" | jq -r '.subdomains[]? // empty')
