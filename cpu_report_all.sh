@@ -2,40 +2,36 @@
 # =============================================================================
 # Cloudways CPU report — ALL servers from ONE machine (SSH + atop)
 #
-# The Cloudways monitoring API often returns no_data for historical CPU.
-# This script uses the API only to list servers, then SSHs into each one
-# and runs atop-based CPU stats remotely.
+# Uses Cloudways API to list servers, then collects atop CPU stats from each
+# server via SSH (or locally when run on that server).
 #
-# Requirements:
-#   - curl, jq, ssh
-#   - CW_EMAIL + CW_API_KEY (to list servers and get IPs)
-#   - SSH key allowed on every server (master@<server-ip>)
-#   - Your IP whitelisted for SSH on each server
+# Requirements: curl, jq, ssh, atop on target servers
+#   - CW_EMAIL + CW_API_KEY
+#   - SSH key + IP whitelisted on each server
 #
 # Usage:
-#   export CW_EMAIL='you@example.com'
-#   export CW_API_KEY='your-api-key'
-#   export SSH_USER='master'          # default: master
-#   export SSH_KEY='~/.ssh/id_rsa'   # optional
+#   ./cpu_report_all.sh --email 'you@example.com' --api-key 'KEY' --days 30
 #
-#   ./cpu_report_all.sh --days 30 --output cpu_report_30d.txt
+# If master@IP fails, try:
+#   --ssh-user root --ssh-host server_id
+#   (uses root@1235009 style when host is the numeric server ID)
 #
-# One-liner:
-#   curl -fsSL https://raw.githubusercontent.com/sultan8898/homeabc/cursor/cpu-usage-report-2439/cpu_report_all.sh | bash -s -- \
-#     --email 'you@example.com' --api-key 'KEY' --days 30 --output cpu_report_30d.txt
+# Debug SSH/connection issues:
+#   ./cpu_report_all.sh ... --debug
 # =============================================================================
 
 set -euo pipefail
 
 API_V2="https://api.cloudways.com/api/v2"
-ATOP_SCRIPT_URL="https://raw.githubusercontent.com/sultan8898/homeabc/cursor/cpu-usage-report-2439/cpu_report_atop.sh"
 DAYS=30
 OUTPUT=""
 CSV=0
 QUIET=0
+DEBUG=0
 SSH_USER="${SSH_USER:-master}"
+SSH_HOST_MODE="${SSH_HOST_MODE:-ip}"   # ip | server_id | both
 SSH_KEY="${SSH_KEY:-}"
-SSH_OPTS="${SSH_OPTS:--o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=accept-new}"
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=25 -o StrictHostKeyChecking=accept-new)
 SLEEP_BETWEEN=2
 
 while [[ $# -gt 0 ]]; do
@@ -46,11 +42,13 @@ while [[ $# -gt 0 ]]; do
         --output) OUTPUT="$2"; shift 2 ;;
         --csv) CSV=1; shift ;;
         --quiet) QUIET=1; shift ;;
+        --debug) DEBUG=1; shift ;;
         --ssh-user) SSH_USER="$2"; shift 2 ;;
         --ssh-key) SSH_KEY="$2"; shift 2 ;;
+        --ssh-host) SSH_HOST_MODE="$2"; shift 2 ;;
         --sleep) SLEEP_BETWEEN="$2"; shift 2 ;;
         -h|--help)
-            sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -65,6 +63,8 @@ command -v ssh >/dev/null 2>&1 || { echo "ssh is required." >&2; exit 1; }
     echo "Set CW_EMAIL and CW_API_KEY or pass --email and --api-key." >&2
     exit 1
 }
+
+dbg() { [[ "$DEBUG" -eq 1 ]] && echo "# $*" >&2; }
 
 api_token() {
     local body http_code
@@ -86,26 +86,129 @@ emit() {
 
 local_server_id() {
     local h
-    h=$(hostname -s 2>/dev/null || hostname)
+    h=$(hostname -s 2>/dev/null || hostname -f 2>/dev/null || hostname)
     [[ "$h" =~ ^[0-9]+$ ]] && echo "$h" && return 0
     [[ "$h" =~ ^([0-9]+)\.cloudwaysapps\.com$ ]] && echo "${BASH_REMATCH[1]}" && return 0
     echo ""
 }
 
-run_local_atop_csv() {
-    if [[ -x "./cpu_report_atop.sh" ]]; then
-        ./cpu_report_atop.sh --days "$DAYS" --csv 2>/dev/null | tail -n1
-        return 0
-    fi
-    curl -fsSL "$ATOP_SCRIPT_URL" | bash -s -- --days "$DAYS" --csv 2>/dev/null | tail -n1
+# Inline atop stats — runs locally or via "bash -s" over SSH (no GitHub needed).
+atop_stats_script() {
+    cat <<'ATOP_EOF'
+set -euo pipefail
+DAYS="${1:-30}"
+ATOP_DIR="/var/log/atop"
+command -v atop >/dev/null 2>&1 || { echo "ERR:no_atop" >&2; exit 3; }
+[[ -d "$ATOP_DIR" ]] || { echo "ERR:no_atop_dir" >&2; exit 3; }
+CUTOFF=$(date -u -d "${DAYS} days ago" +%Y%m%d 2>/dev/null || date -u -v-"${DAYS}"d +%Y%m%d)
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+for log in "$ATOP_DIR"/atop_*.1; do
+  [[ -f "$log" ]] || continue
+  base=$(basename "$log")
+  [[ "$base" =~ atop_([0-9]{8})\.1$ ]] || continue
+  [[ "${BASH_REMATCH[1]}" -ge "$CUTOFF" ]] || continue
+  atop -r "$log" -b 00:00 -e 23:59 2>/dev/null | awk '
+    /^CPU \|/ {
+      sub(/%/, "", $4); user = $4 + 0
+      sub(/%/, "", $6); sys = $6 + 0
+      print user + sys
+    }' >> "$TMP"
+done
+[[ -s "$TMP" ]] || { echo "ERR:no_samples" >&2; exit 4; }
+awk -v days="$DAYS" '
+  { v[NR] = $1 + 0; sum += $1; if ($1 > max || NR == 1) max = $1 }
+  END {
+    n = NR; asort(v)
+    idx = int(0.95 * n); if (idx < 1) idx = 1; if (idx > n) idx = n
+  printf "samples=%d avg=%.2f max=%.2f p95=%.2f logs=%d\n", n, sum/n, max, v[idx], NR
+  }' "$TMP"
+ATOP_EOF
 }
 
-run_remote_atop_csv() {
-    local ip="$1"
-    local ssh_cmd=(ssh $SSH_OPTS)
+run_atop_local() {
+    bash -s "$DAYS" <<< "$(atop_stats_script)" 2>&1
+}
+
+run_atop_ssh() {
+    local target="$1"
+    local ssh_cmd=(ssh "${SSH_OPTS[@]}")
     [[ -n "$SSH_KEY" ]] && ssh_cmd+=(-i "$SSH_KEY")
-    ssh_cmd+=("${SSH_USER}@${ip}")
-    "${ssh_cmd[@]}" "curl -fsSL '$ATOP_SCRIPT_URL' | bash -s -- --days $DAYS --csv" 2>/dev/null | tail -n1
+    ssh_cmd+=("$target" "bash -s $DAYS")
+    "${ssh_cmd[@]}" 2>&1 <<< "$(atop_stats_script)"
+}
+
+ssh_targets_for() {
+    local sid="$1" ip="$2"
+    case "$SSH_HOST_MODE" in
+        ip)
+            [[ -n "$ip" && "$ip" != "null" ]] && echo "${SSH_USER}@${ip}"
+            ;;
+        server_id)
+            echo "${SSH_USER}@${sid}"
+            ;;
+        both)
+            [[ -n "$ip" && "$ip" != "null" ]] && echo "${SSH_USER}@${ip}"
+            echo "${SSH_USER}@${sid}"
+            ;;
+        *) echo "${SSH_USER}@${ip}" ;;
+    esac
+}
+
+collect_server_stats() {
+    local sid="$1" ip="$2"
+    local out target err
+
+    if [[ -n "$LOCAL_SID" && "$sid" == "$LOCAL_SID" ]]; then
+        dbg "server $sid: trying local atop"
+        if out=$(run_atop_local); then
+            echo "atop-local|$out"
+            return 0
+        fi
+        dbg "server $sid: local atop failed: $out"
+    fi
+
+    while IFS= read -r target; do
+        [[ -z "$target" ]] && continue
+        dbg "server $sid: trying ssh $target"
+        err=$(mktemp)
+        if out=$(run_atop_ssh "$target" 2>"$err"); then
+            rm -f "$err"
+            echo "atop-ssh|$out"
+            return 0
+        fi
+        dbg "server $sid: ssh $target failed: $(tr '\n' ' ' < "$err")"
+        rm -f "$err"
+    done < <(ssh_targets_for "$sid" "$ip")
+
+    echo "no_data|"
+    return 1
+}
+
+parse_atop_output() {
+    local source_line="$1"
+    local source="${source_line%%|*}"
+    local body="${source_line#*|}"
+    local samples avg max p95
+
+    if [[ "$body" =~ samples=([0-9]+) ]]; then
+        samples="${BASH_REMATCH[1]}"
+    fi
+    if [[ "$body" =~ avg=([0-9.]+) ]]; then
+        avg="${BASH_REMATCH[1]}"
+    fi
+    if [[ "$body" =~ max=([0-9.]+) ]]; then
+        max="${BASH_REMATCH[1]}"
+    fi
+    if [[ "$body" =~ p95=([0-9.]+) ]]; then
+        p95="${BASH_REMATCH[1]}"
+    fi
+
+    if [[ -n "$samples" && "$samples" != "0" ]]; then
+        echo "${samples}|${avg}|${max}|${p95}|${source}"
+        return 0
+    fi
+    echo "0||||no_data"
 }
 
 TOKEN=$(api_token) || exit 1
@@ -113,6 +216,13 @@ SERVERS_JSON=$(curl -fsS --max-time 60 -H "Authorization: Bearer ${TOKEN}" \
     -H "Accept: application/json" "${API_V2}/server")
 
 LOCAL_SID=$(local_server_id)
+dbg "local_server_id=${LOCAL_SID:-none}"
+
+if [[ "$DEBUG" -eq 1 ]]; then
+    echo "# servers from API:" >&2
+    echo "$SERVERS_JSON" | jq -r '.servers[]? | "\(.id)\t\(.label)\t\(.public_ip // .server_ips[0] // "NO_IP")"' >&2
+fi
+
 REPORT_DATE=$(date -u '+%Y-%m-%d %H:%M UTC')
 ACCOUNT_EMAIL_MASKED="${CW_EMAIL/@*/@***}"
 
@@ -126,7 +236,8 @@ else
     emit "Generated : ${REPORT_DATE}"
     emit "Account   : ${ACCOUNT_EMAIL_MASKED}"
     emit "Period    : last ${DAYS} day(s) via atop (SSH to each server)"
-    emit "SSH user  : ${SSH_USER}"
+    emit "SSH user  : ${SSH_USER}  (host mode: ${SSH_HOST_MODE})"
+    [[ -n "$LOCAL_SID" ]] && emit "Local srv : ${LOCAL_SID} (atop used locally when matched)"
     emit "================================================================"
     emit ""
     emit "$(printf '%-8s %-28s %-10s %-8s %-6s %7s %7s %7s %7s' \
@@ -142,43 +253,32 @@ while IFS=$'\t' read -r sid label status cloud region ip; do
     [[ -z "$sid" ]] && continue
     TOTAL=$((TOTAL + 1))
 
-    result="no_data"
-    samples="" avg="" max="" p95=""
+    raw=$(collect_server_stats "$sid" "$ip" || true)
+    IFS='|' read -r samples avg max p95 result <<< "$(parse_atop_output "$raw")"
 
-    if [[ -n "$LOCAL_SID" && "$sid" == "$LOCAL_SID" ]]; then
-        row=$(run_local_atop_csv || true)
-        source_note="atop-local"
-    elif [[ -n "$ip" && "$ip" != "null" ]]; then
-        row=$(run_remote_atop_csv "$ip" || true)
-        source_note="atop-ssh"
-    else
-        row=""
-        source_note="no_ip"
-    fi
-
-    if [[ -n "$row" ]]; then
-        IFS=$'\t' read -r rid rlabel days logs samples avg max p95 rsource <<< "$row"
-        if [[ -n "$samples" && "$samples" != "0" ]]; then
-            result="$source_note"
-            OK=$((OK + 1))
-        else
-            FAILED=$((FAILED + 1))
-        fi
+    if [[ "$result" != "no_data" && -n "$samples" && "$samples" != "0" ]]; then
+        OK=$((OK + 1))
     else
         FAILED=$((FAILED + 1))
+        result="no_data"
+        samples="0"
     fi
 
     label=${label:-"(unnamed)"}
     if [[ "$CSV" -eq 1 ]]; then
-        emit "${sid}\t${label}\t${status}\t${cloud}\t${region}\t${samples:-0}\t${avg:-}\t${max:-}\t${p95:-}\t${result}"
+        emit "${sid}\t${label}\t${status}\t${cloud}\t${region}\t${samples}\t${avg}\t${max}\t${p95}\t${result}"
     else
         emit "$(printf '%-8s %-28s %-10s %-8s %-6s %7s %7s %7s %7s %s' \
-            "$sid" "$label" "$status" "$cloud" "$region" "${samples:-0}" "${avg:-}" "${max:-}" "${p95:-}" "$result")"
+            "$sid" "$label" "$status" "$cloud" "$region" "$samples" "${avg:-}" "${max:-}" "${p95:-}" "$result")"
     fi
 
     sleep "$SLEEP_BETWEEN"
 done < <(echo "$SERVERS_JSON" | jq -r '.servers[]? |
-    [.id, .label, .status, .cloud, .region, (.public_ip // .server_ips[0] // "")] | @tsv')
+    [.id, .label, .status, .cloud, .region,
+     (if (.public_ip? // "") != "" then .public_ip
+      elif (.server_ips? | type) == "array" then (.server_ips[0] // "")
+      elif (.server_ips? | type) == "string" then .server_ips
+      else "" end)] | @tsv')
 
 if [[ "$CSV" -eq 0 ]]; then
     emit ""
@@ -187,7 +287,8 @@ if [[ "$CSV" -eq 0 ]]; then
     emit "----------------------------------------------------------------"
     emit ""
     emit "Notes:"
-    emit "- Run from one machine with SSH access to all servers (master@IP + key whitelisted)."
-    emit "- Cloudways API does not expose historical CPU; atop on each server is the source."
-    emit "- If SSH fails, whitelist your IP under Server → Master Credentials → SSH/SFTP."
+    emit "- Re-run with --debug to see SSH targets and errors on stderr."
+    emit "- If master@IP fails, try: --ssh-user root --ssh-host server_id"
+    emit "- Whitelist your IP: Server → Master Credentials → SSH/SFTP."
+    emit "- cpu_report.sh on one server still works for that server only (atop fallback)."
 fi
