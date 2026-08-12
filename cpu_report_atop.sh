@@ -41,13 +41,13 @@ command -v atop >/dev/null 2>&1 || { echo "atop is required (install atop packag
 [[ -d "$ATOP_DIR" ]] || { echo "Missing $ATOP_DIR — run this on a Cloudways server." >&2; exit 1; }
 
 detect_server_id() {
-    local h id
-    h=$(hostname -f 2>/dev/null || hostname)
-    if [[ "$h" =~ ^([0-9]+)\.cloudwaysapps\.com$ ]]; then
+    local h
+    h=$(hostname -s 2>/dev/null || hostname -f 2>/dev/null || hostname)
+    if [[ "$h" =~ ^([0-9]+)$ ]]; then
         echo "${BASH_REMATCH[1]}"
         return 0
     fi
-    if [[ "$h" =~ ^([0-9]+)$ ]]; then
+    if [[ "$h" =~ ^([0-9]+)\.cloudwaysapps\.com$ ]]; then
         echo "${BASH_REMATCH[1]}"
         return 0
     fi

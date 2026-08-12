@@ -2,8 +2,8 @@
 # =============================================================================
 # Cloudways CPU usage report — all servers, configurable lookback (default 30d)
 #
-# Pulls historical CPU time-series from the Cloudways monitoring API and prints
-# a customer-ready summary (avg / max / p95) per server.
+# Pulls historical CPU from the Cloudways API; auto-falls back to local atop logs
+# when run on a Cloudways server and the API returns no_data for that server.
 #
 # Requirements: curl, jq
 #
@@ -29,7 +29,7 @@
 #   --sleep S      Seconds between per-server API calls (default: 1)
 #   --server-id ID Only report one server (repeatable)
 #   --debug        Print API metadata and save raw JSON per server to /tmp
-#   --source api|atop-hint  Force data source notes (default: api)
+#   --no-atop      Disable local atop fallback when API returns no_data
 # =============================================================================
 
 set -euo pipefail
@@ -45,6 +45,7 @@ OUTPUT=""
 QUIET=0
 SLEEP_BETWEEN=1
 DEBUG=0
+ATOP_FALLBACK=1
 declare -a ONLY_SERVER_IDS=()
 
 while [[ $# -gt 0 ]]; do
@@ -61,6 +62,7 @@ while [[ $# -gt 0 ]]; do
         --sleep) SLEEP_BETWEEN="$2"; shift 2 ;;
         --server-id) ONLY_SERVER_IDS+=("$2"); shift 2 ;;
         --debug) DEBUG=1; shift ;;
+        --no-atop) ATOP_FALLBACK=0; shift ;;
         -h|--help)
             sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -281,6 +283,60 @@ stats_from_values() {
     echo "${count},${avg},${max},${p95},ok"
 }
 
+local_server_id() {
+    local h
+    h=$(hostname -s 2>/dev/null || hostname -f 2>/dev/null || hostname)
+    if [[ "$h" =~ ^([0-9]+)$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ "$h" =~ ^([0-9]+)\.cloudwaysapps\.com$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ -d /home/master/applications ]]; then
+        h=$(ls /home/master/applications 2>/dev/null | head -n1 | grep -oE '^[0-9]+' || true)
+        [[ -n "$h" ]] && echo "$h" && return 0
+    fi
+    echo ""
+}
+
+atop_stats_for_days() {
+  local days="$1" atop_dir="/var/log/atop" cutoff tmp
+  command -v atop >/dev/null 2>&1 || return 1
+  [[ -d "$atop_dir" ]] || return 1
+
+  cutoff=$(date -u -d "${days} days ago" +%Y%m%d 2>/dev/null || date -u -v-"${days}"d +%Y%m%d)
+  tmp=$(mktemp)
+
+  for log in "$atop_dir"/atop_*.1; do
+    [[ -f "$log" ]] || continue
+    base=$(basename "$log")
+    if [[ "$base" =~ atop_([0-9]{8})\.1$ ]]; then
+      [[ "${BASH_REMATCH[1]}" -ge "$cutoff" ]] || continue
+    fi
+    atop -r "$log" -b 00:00 -e 23:59 2>/dev/null | awk '
+      /^CPU \|/ {
+        sub(/%/, "", $4); user = $4 + 0
+        sub(/%/, "", $6); sys = $6 + 0
+        print user + sys
+      }' >> "$tmp"
+  done
+
+  [[ -s "$tmp" ]] || { rm -f "$tmp"; return 1; }
+  awk '
+    { v[NR] = $1 + 0; sum += $1; if ($1 > max || NR == 1) max = $1 }
+    END {
+      n = NR
+      if (n == 0) exit 1
+      asort(v)
+      idx = int(0.95 * n); if (idx < 1) idx = 1; if (idx > n) idx = n
+      printf "%d,%.2f,%.2f,%.2f", n, sum/n, max, v[idx]
+    }
+  ' "$tmp"
+  rm -f "$tmp"
+}
+
 emit() {
     if [[ -n "$OUTPUT" ]]; then
         printf '%s\n' "$1" >> "$OUTPUT"
@@ -302,6 +358,7 @@ fi
 
 TARGET_JSON=$(api_get "${API_V1}/monitor_targets" 2>/dev/null || api_get "${API_V2}/monitoring/targets" 2>/dev/null || echo '{}')
 TARGET=$(pick_target "$TARGET_JSON")
+LOCAL_SID=$(local_server_id)
 
 if [[ "$DEBUG" -eq 1 ]]; then
     echo "# duration=${DURATION} target=${TARGET}" >&2
@@ -341,6 +398,8 @@ else
   emit "Generated : ${REPORT_DATE}"
   emit "Account   : ${ACCOUNT_EMAIL_MASKED}"
   emit "Period    : last ${DAYS} day(s)  (duration=${DURATION}, target=${TARGET})"
+  [[ -n "$LOCAL_SID" && "$ATOP_FALLBACK" -eq 1 ]] && \
+    emit "Atop      : enabled for local server ${LOCAL_SID} when API has no_data"
   emit "================================================================"
   emit ""
   emit "$(printf '%-8s %-28s %-10s %-8s %-6s %7s %7s %7s %7s' \
@@ -360,7 +419,14 @@ while IFS=$'\t' read -r sid label status cloud region; do
     VALUES=$(echo "$DETAIL_JSON" | extract_cpu_values || true)
     IFS=',' read -r samples avg max p95 result <<< "$(stats_from_values "$VALUES")"
 
-    if [[ "$result" == "ok" ]]; then
+    if [[ "$result" != "ok" && "$ATOP_FALLBACK" -eq 1 && -n "$LOCAL_SID" && "$sid" == "$LOCAL_SID" ]]; then
+        if atop_line=$(atop_stats_for_days "$DAYS" 2>/dev/null); then
+            IFS=',' read -r samples avg max p95 <<< "$atop_line"
+            result="atop"
+        fi
+    fi
+
+    if [[ "$result" == "ok" || "$result" == "atop" ]]; then
         OK=$((OK + 1))
     else
         FAILED=$((FAILED + 1))
@@ -389,8 +455,7 @@ if [[ "$CSV" -eq 0 ]]; then
   emit "----------------------------------------------------------------"
   emit ""
   emit "Notes:"
-  emit "- Percentages are computed from Cloudways monitoring graph datapoints."
-  emit "- If API shows no_data, run cpu_report_atop.sh ON each server (uses /var/log/atop)."
-  emit "- Share this file directly with the customer, or use --csv for Excel/Sheets."
+  emit "- API monitoring graph often returns no_data; atop fallback fills local server row."
+  emit "- For other servers: SSH in and run cpu_report_atop.sh, or use --server-id on each."
   emit "- Re-run with --debug to save raw API JSON under /tmp/cw_cpu_*.json"
 fi
