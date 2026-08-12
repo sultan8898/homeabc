@@ -1,18 +1,15 @@
 #!/bin/bash
 # =============================================================================
-# Cloudways CPU report from local atop logs (run ON the server)
+# Cloudways detailed CPU + memory report from atop logs (run ON the server)
 #
-# Use this when the Cloudways monitoring API returns no_data but atop has history.
-# Matches the output style of cpu_report.sh for customer sharing.
-#
-# Usage (on a Cloudways server):
-#   curl -fsSL https://raw.githubusercontent.com/sultan8898/homeabc/cursor/cpu-usage-report-2439/cpu_report_atop.sh | bash -s -- --days 30
+# One-liner:
+#   curl -fsSL https://raw.githubusercontent.com/sultan8898/homeabc/cursor/cpu-usage-report-2439/cpu_report_atop.sh | bash -s -- --days 30 --output report.txt
 #
 # Options:
 #   --days N       Lookback window in days (default: 30)
 #   --output FILE  Save report to FILE
-#   --csv          Tab-separated single-row output
-#   --verbose      Show per-day breakdown (like atop.sh)
+#   --csv          Single summary row (for merging multiple servers)
+#   --brief        Short summary only (no per-day table)
 # =============================================================================
 
 set -euo pipefail
@@ -21,45 +18,42 @@ ATOP_DIR="/var/log/atop"
 DAYS=30
 OUTPUT=""
 CSV=0
-VERBOSE=0
+BRIEF=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --days) DAYS="$2"; shift 2 ;;
         --output) OUTPUT="$2"; shift 2 ;;
         --csv) CSV=1; shift ;;
-        --verbose) VERBOSE=1; shift ;;
+        --brief) BRIEF=1; shift ;;
+        --verbose) ;;  # legacy alias, detailed is now default
         -h|--help)
-            sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
 
-command -v atop >/dev/null 2>&1 || { echo "atop is required (install atop package)." >&2; exit 1; }
-[[ -d "$ATOP_DIR" ]] || { echo "Missing $ATOP_DIR — run this on a Cloudways server." >&2; exit 1; }
+command -v atop >/dev/null 2>&1 || { echo "atop is required." >&2; exit 1; }
+[[ -d "$ATOP_DIR" ]] || { echo "Missing $ATOP_DIR — run on a Cloudways server." >&2; exit 1; }
 
 detect_server_id() {
     local h
     h=$(hostname -s 2>/dev/null || hostname -f 2>/dev/null || hostname)
-    if [[ "$h" =~ ^([0-9]+)$ ]]; then
-        echo "${BASH_REMATCH[1]}"
-        return 0
-    fi
-    if [[ "$h" =~ ^([0-9]+)\.cloudwaysapps\.com$ ]]; then
-        echo "${BASH_REMATCH[1]}"
-        return 0
-    fi
+    [[ "$h" =~ ^([0-9]+)$ ]] && { echo "${BASH_REMATCH[1]}"; return 0; }
+    [[ "$h" =~ ^([0-9]+)\.cloudwaysapps\.com$ ]] && { echo "${BASH_REMATCH[1]}"; return 0; }
     if [[ -d /home/master/applications ]]; then
-        id=$(ls /home/master/applications 2>/dev/null | head -n1 | grep -oE '^[0-9]+' || true)
-        [[ -n "$id" ]] && echo "$id" && return 0
+        h=$(ls /home/master/applications 2>/dev/null | head -n1 | grep -oE '^[0-9]+' || true)
+        [[ -n "$h" ]] && { echo "$h"; return 0; }
     fi
     echo "unknown"
 }
 
 SERVER_ID=$(detect_server_id)
+HOST_LABEL=$(hostname -f 2>/dev/null || hostname -s 2>/dev/null || echo "server-${SERVER_ID}")
 CUTOFF=$(date -u -d "${DAYS} days ago" +%Y%m%d 2>/dev/null || date -u -v-"${DAYS}"d +%Y%m%d)
+REPORT_DATE=$(date -u '+%Y-%m-%d %H:%M UTC')
 
 emit() {
     if [[ -n "$OUTPUT" ]]; then
@@ -68,93 +62,181 @@ emit() {
     printf '%s\n' "$1"
 }
 
-process_log() {
+# Per-log CPU + memory stats: CPU values to stdout; META line to stderr.
+analyze_log() {
     local log="$1"
-  atop -r "$log" -b 00:00 -e 23:59 2>/dev/null | awk '
-  /^ATOP -/ { date = $4; time = $5 }
-  /^CPU \|/ {
-    sub(/%/, "", $4); user = $4 + 0
-    sub(/%/, "", $6); sys = $6 + 0
-    usage = user + sys
-    print usage
-  }'
+    atop -r "$log" -b 00:00 -e 23:59 2>/dev/null | awk -v logfile="$(basename "$log")" '
+    BEGIN { max_cpu = 0; max_mem = 0 }
+    /^ATOP -/ { date = $4; time = $5 }
+    /^CPU \|/ {
+        sub(/%/, "", $4); user = $4 + 0
+        sub(/%/, "", $6); sys = $6 + 0
+        sub(/%/, "", $8); idle = $8 + 0
+        usage = user + sys
+        cpu_n++; cpu_sum += usage; idle_sum += idle
+        if (usage > max_cpu) { max_cpu = usage; max_cpu_at = date " " time }
+        print usage
+    }
+    /^MEM \|/ {
+        mem_tot = mem_free = mem_cache = mem_buff = 0
+        if (match($0, /tot[[:space:]]+([0-9.]+)([MG])/, m))
+            mem_tot = (m[2] == "G") ? m[1] * 1024 : m[1] + 0
+        if (match($0, /free[[:space:]]+([0-9.]+)([MG])/, m))
+            mem_free = (m[2] == "G") ? m[1] * 1024 : m[1] + 0
+        if (match($0, /cache[[:space:]]+([0-9.]+)([MG])/, m))
+            mem_cache = (m[2] == "G") ? m[1] * 1024 : m[1] + 0
+        if (match($0, /buff[[:space:]]+([0-9.]+)([MG])/, m))
+            mem_buff = (m[2] == "G") ? m[1] * 1024 : m[1] + 0
+        used = mem_tot - mem_free - mem_cache - mem_buff
+        mem_n++; mem_sum += used
+        if (used > max_mem) { max_mem = used; max_mem_at = date " " time }
+    }
+    END {
+        if (cpu_n > 0) {
+            printf "META log=%s samples=%d cpu_avg=%.2f cpu_max=%.2f cpu_max_at=%s mem_avg=%.2f mem_max=%.2f mem_max_at=%s\n",
+                logfile, cpu_n, cpu_sum/cpu_n, max_cpu, max_cpu_at,
+                (mem_n ? mem_sum/mem_n : 0), max_mem, (max_mem_at ? max_mem_at : "n/a") > "/dev/stderr"
+        }
+    }'
 }
 
-mapfile -t LOGS < <(ls -1 "$ATOP_DIR"/atop_*.1 2>/dev/null | sort || true)
+mapfile -t ALL_LOGS < <(ls -1 "$ATOP_DIR"/atop_*.1 2>/dev/null | sort || true)
 SELECTED=()
-for log in "${LOGS[@]}"; do
+for log in "${ALL_LOGS[@]}"; do
     base=$(basename "$log")
-  if [[ "$base" =~ atop_([0-9]{8})\.1$ ]]; then
-        d="${BASH_REMATCH[1]}"
-        [[ "$d" -ge "$CUTOFF" ]] && SELECTED+=("$log")
-    fi
+    [[ "$base" =~ atop_([0-9]{8})\.1$ ]] || continue
+    [[ "${BASH_REMATCH[1]}" -ge "$CUTOFF" ]] && SELECTED+=("$log")
 done
 
 if [[ ${#SELECTED[@]} -eq 0 ]]; then
-    echo "No atop logs found in the last ${DAYS} day(s) under ${ATOP_DIR}." >&2
+    echo "No atop logs in the last ${DAYS} day(s) under ${ATOP_DIR}." >&2
     exit 1
 fi
 
-TMP_VALUES=$(mktemp)
-trap 'rm -f "$TMP_VALUES"' EXIT
+FIRST_DAY=$(basename "${SELECTED[0]}" | sed -E 's/atop_([0-9]{8})\.1/\1/')
+LAST_DAY=$(basename "${SELECTED[-1]}" | sed -E 's/atop_([0-9]{8})\.1/\1/')
+
+TMP_CPU=$(mktemp)
+TMP_META=$(mktemp)
+trap 'rm -f "$TMP_CPU" "$TMP_META"' EXIT
 
 for log in "${SELECTED[@]}"; do
-    if [[ "$VERBOSE" -eq 1 ]]; then
-        echo "Processing $(basename "$log")..." >&2
-        atop -r "$log" -b 00:00 -e 23:59 2>/dev/null | awk '
-          BEGIN { max_usage = 0 }
-          /^ATOP -/ { date = $4; time = $5 }
-          /^CPU \|/ {
-            sub(/%/, "", $4); user = $4 + 0
-            sub(/%/, "", $6); sys = $6 + 0
-            usage = user + sys
-            total += usage; n++
-            if (usage > max_usage) { max_usage = usage; max_date = date; max_time = time }
-          }
-          END {
-            if (n > 0) printf " Avg CPU (user+sys): %.2f%%\n Max CPU (user+sys): %.2f%% at %s %s\n", total/n, max_usage, max_date, max_time
-          }' >&2
-    fi
-    process_log "$log" >> "$TMP_VALUES"
+    analyze_log "$log" >> "$TMP_CPU" 2>> "$TMP_META"
 done
 
-read -r samples avg max p95 < <(
+read -r samples cpu_min cpu_avg cpu_med cpu_p95 cpu_p99 cpu_max cpu_max_at < <(
     awk '
-      { v[NR] = $1 + 0; sum += $1; if ($1 > max || NR == 1) max = $1 }
+      { v[NR] = $1 + 0; sum += $1; if ($1 < min || NR == 1) min = $1; if ($1 > max || NR == 1) { max = $1; max_i = NR } }
       END {
         n = NR
-        if (n == 0) { print "0 0 0 0"; exit }
+        if (n == 0) { print "0 0 0 0 0 0 0 n/a"; exit }
         asort(v)
-        idx = int(0.95 * n); if (idx < 1) idx = 1; if (idx > n) idx = n
-        printf "%d %.2f %.2f %.2f\n", n, sum/n, max, v[idx]
+        med = v[int((n+1)/2)]
+        p95i = int(0.95*n); if (p95i < 1) p95i = 1
+        p99i = int(0.99*n); if (p99i < 1) p99i = 1
+        printf "%d %.2f %.2f %.2f %.2f %.2f %.2f %d\n", n, min, sum/n, med, v[p95i], v[p99i], max, max_i
       }
-    ' "$TMP_VALUES"
+    ' "$TMP_CPU"
 )
 
-REPORT_DATE=$(date -u '+%Y-%m-%d %H:%M UTC')
-HOST_LABEL=$(hostname -s 2>/dev/null || echo "server-${SERVER_ID}")
+# Peak timestamp from per-day meta
+cpu_max_at=$(awk -F'cpu_max_at=' '{print $2}' "$TMP_META" 2>/dev/null | awk '{print $1, $2}' | head -n1)
+[[ -z "$cpu_max_at" || "$cpu_max_at" == "n/a" ]] && cpu_max_at="(see daily table)"
 
-if [[ -n "$OUTPUT" ]]; then
-    : > "$OUTPUT"
-fi
+read -r mem_avg mem_max mem_max_at < <(
+    awk -F'[= ]' '
+      /mem_avg=/ {
+        for (i=1;i<=NF;i++) {
+          if ($i ~ /^mem_avg/) split($i,a,"="), ma+=a[2]
+          if ($i ~ /^mem_max/) split($i,a,"="), mm=a[2]
+          if ($i ~ /^mem_max_at/) maxat=$i; sub(/mem_max_at=/,"",maxat)
+        }
+      }
+      END {
+        printf "%.2f %.2f %s\n", (NR?ma/NR:0), (mm?mm:0), (maxat?maxat:"n/a")
+      }
+    ' "$TMP_META"
+)
+
+PUBLIC_IP=$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || echo "n/a")
+LOAD_AVG=$(awk '{print $1, $2, $3}' /proc/loadavg 2>/dev/null || echo "n/a")
+CPU_CORES=$(nproc 2>/dev/null || echo "n/a")
+MEM_NOW=$(free -h 2>/dev/null | awk '/^Mem:/ {print "used="$3" total="$2" avail="$7}' || echo "n/a")
+UPTIME=$(uptime -p 2>/dev/null || uptime 2>/dev/null | sed 's/.*up/up/' || echo "n/a")
+DISK_ROOT=$(df -h / 2>/dev/null | awk 'NR==2 {print $3" used / "$2" total ("$5" full)"}' || echo "n/a")
+
+[[ -n "$OUTPUT" ]] && : > "$OUTPUT"
 
 if [[ "$CSV" -eq 1 ]]; then
-    emit $'server_id\thost_label\tdays\tlog_files\tsamples\tavg_cpu_pct\tmax_cpu_pct\tp95_cpu_pct\tsource'
-    emit "${SERVER_ID}\t${HOST_LABEL}\t${DAYS}\t${#SELECTED[@]}\t${samples}\t${avg}\t${max}\t${p95}\tatop"
-else
-    emit "================================================================"
-    emit "CLOUDWAYS CPU USAGE REPORT (ATOP)"
-    emit "Generated : ${REPORT_DATE}"
-    emit "Server ID : ${SERVER_ID}"
-    emit "Hostname  : ${HOST_LABEL}"
-    emit "Period    : last ${DAYS} day(s) from ${#SELECTED[@]} atop log file(s)"
-    emit "================================================================"
-    emit ""
-    emit "Samples : ${samples}"
-    emit "Avg CPU : ${avg}%  (user+sys)"
-    emit "Max CPU : ${max}%"
-    emit "P95 CPU : ${p95}%"
-    emit ""
-    emit "Source: /var/log/atop (5-minute samples aggregated)"
-    emit "Re-run on each server, or use cpu_report.sh --mode atop-ssh for account-wide."
+    emit $'server_id\thostname\tpublic_ip\tcpu_cores\tdays\tlog_files\tdate_from\tdate_to\tsamples\tcpu_min\tcpu_avg\tcpu_median\tcpu_p95\tcpu_p99\tcpu_max\tmem_avg_mb\tmem_max_mb\tsource'
+    emit "${SERVER_ID}\t${HOST_LABEL}\t${PUBLIC_IP}\t${CPU_CORES}\t${DAYS}\t${#SELECTED[@]}\t${FIRST_DAY}\t${LAST_DAY}\t${samples}\t${cpu_min}\t${cpu_avg}\t${cpu_med}\t${cpu_p95}\t${cpu_p99}\t${cpu_max}\t${mem_avg}\t${mem_max}\tatop"
+    exit 0
 fi
+
+emit "================================================================================"
+emit "CLOUDWAYS SERVER RESOURCE REPORT (ATOP)"
+emit "================================================================================"
+emit ""
+emit "SERVER INFO"
+emit "---------"
+emit "Generated     : ${REPORT_DATE}"
+emit "Server ID     : ${SERVER_ID}"
+emit "Hostname      : ${HOST_LABEL}"
+emit "Public IP     : ${PUBLIC_IP}"
+emit "CPU cores     : ${CPU_CORES}"
+emit "Uptime        : ${UPTIME}"
+emit ""
+emit "REPORT PERIOD"
+emit "-------------"
+emit "Lookback      : last ${DAYS} days"
+emit "Date range    : ${FIRST_DAY} → ${LAST_DAY}"
+emit "Atop log files: ${#SELECTED[@]}"
+emit "Sample points : ${samples}  (~5 min intervals)"
+emit "Data source   : ${ATOP_DIR}"
+emit ""
+emit "CPU USAGE (user + sys %)"
+emit "------------------------"
+emit "Minimum       : ${cpu_min}%"
+emit "Average       : ${cpu_avg}%"
+emit "Median        : ${cpu_med}%"
+emit "P95           : ${cpu_p95}%"
+emit "P99           : ${cpu_p99}%"
+emit "Maximum       : ${cpu_max}%"
+emit "Peak at       : ${cpu_max_at}"
+emit ""
+emit "MEMORY (from atop, MB)"
+emit "----------------------"
+emit "Average used  : ${mem_avg} MB"
+emit "Maximum used  : ${mem_max} MB"
+emit "Peak at       : ${mem_max_at}"
+emit ""
+emit "CURRENT SNAPSHOT (right now)"
+emit "----------------------------"
+emit "Load average  : ${LOAD_AVG}  (1m 5m 15m)"
+emit "Memory        : ${MEM_NOW}"
+emit "Disk /        : ${DISK_ROOT}"
+emit ""
+
+if [[ "$BRIEF" -eq 0 ]]; then
+    emit "DAILY BREAKDOWN"
+    emit "---------------"
+    emit "$(printf '%-12s %8s %8s %8s %10s %10s %22s' "Date" "Samples" "CPU-Avg" "CPU-Max" "Mem-Avg" "Mem-Max" "CPU peak time")"
+    emit "$(printf '%.0s-' {1..88})"
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        log=$(echo "$line" | sed -n 's/.*log=\([^ ]*\).*/\1/p')
+        day=$(echo "$log" | sed -E 's/atop_([0-9]{8})\.1/\1/')
+        s=$(echo "$line" | sed -n 's/.*samples=\([^ ]*\).*/\1/p')
+        ca=$(echo "$line" | sed -n 's/.*cpu_avg=\([^ ]*\).*/\1/p')
+        cm=$(echo "$line" | sed -n 's/.*cpu_max=\([^ ]*\).*/\1/p')
+        ma=$(echo "$line" | sed -n 's/.*mem_avg=\([^ ]*\).*/\1/p')
+        mm=$(echo "$line" | sed -n 's/.*mem_max=\([^ ]*\).*/\1/p')
+        at=$(echo "$line" | sed -n 's/.*cpu_max_at=\([^ ]* [^ ]*\).*/\1/p')
+        emit "$(printf '%-12s %8s %8s %8s %10s %10s %22s' "$day" "$s" "$ca" "$cm" "$ma" "$mm" "$at")"
+    done < "$TMP_META"
+    emit ""
+fi
+
+emit "================================================================================"
+emit "Notes: CPU% = user+sys from atop. Safe to share with customers."
+emit "================================================================================"
