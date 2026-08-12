@@ -3,29 +3,38 @@
 # Cloudways detailed CPU + memory report from atop logs (run ON the server)
 #
 # One-liner:
-#   curl -fsSL https://raw.githubusercontent.com/sultan8898/homeabc/cursor/cpu-usage-report-2439/cpu_report_atop.sh | bash -s -- --days 30 --output report.txt
+#   curl -fsSL .../cpu_report_atop.sh | bash -s -- \
+#     --email 'you@example.com' --api-key 'KEY' --days 30 --output report.txt
 #
 # Options:
+#   --email        Cloudways email (lists all server IPs at end of report)
+#   --api-key      Cloudways API key
 #   --days N       Lookback window in days (default: 30)
 #   --output FILE  Save report to FILE
 #   --csv          Single summary row (for merging multiple servers)
 #   --brief        Short summary only (no per-day table)
+#   --no-server-list  Skip account server IP list
 # =============================================================================
 
 set -euo pipefail
 
 ATOP_DIR="/var/log/atop"
+API_V2="https://api.cloudways.com/api/v2"
 DAYS=30
 OUTPUT=""
 CSV=0
 BRIEF=0
+SHOW_SERVER_LIST=1
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --email) CW_EMAIL="$2"; shift 2 ;;
+        --api-key) CW_API_KEY="$2"; shift 2 ;;
         --days) DAYS="$2"; shift 2 ;;
         --output) OUTPUT="$2"; shift 2 ;;
         --csv) CSV=1; shift ;;
         --brief) BRIEF=1; shift ;;
+        --no-server-list) SHOW_SERVER_LIST=0; shift ;;
         --verbose) ;;  # legacy alias, detailed is now default
         -h|--help)
             sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
@@ -60,6 +69,65 @@ emit() {
         printf '%s\n' "$1" >> "$OUTPUT"
     fi
     printf '%s\n' "$1"
+}
+
+api_token() {
+    local body http_code
+    body=$(curl -sS --max-time 30 -w $'\n__HTTP_CODE__:%{http_code}' -X POST "${API_V2}/oauth/access_token" \
+        -H "Content-Type: application/json" \
+        -d "{\"email\":\"${CW_EMAIL}\",\"api_key\":\"${CW_API_KEY}\"}")
+    http_code="${body##*$'\n__HTTP_CODE__:'}"
+    body="${body%$'\n__HTTP_CODE__:'*}"
+    [[ "$http_code" == "200" ]] || return 1
+    echo "$body" | jq -r '.access_token // empty'
+}
+
+emit_all_servers() {
+    local token json
+    [[ "$SHOW_SERVER_LIST" -eq 1 ]] || return 0
+    [[ -n "${CW_EMAIL:-}" && -n "${CW_API_KEY:-}" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+
+    token=$(api_token) || {
+        emit ""
+        emit "ALL SERVERS (API list unavailable — check CW_EMAIL / CW_API_KEY)"
+        return 0
+    }
+
+    json=$(curl -fsS --max-time 60 -H "Authorization: Bearer ${token}" \
+        -H "Accept: application/json" "${API_V2}/server") || return 0
+
+    emit ""
+    emit "ALL SERVERS IN ACCOUNT (copy SSH command for the next server)"
+    emit "================================================================"
+    emit "$(printf '%-4s %-10s %-28s %-16s %-8s %-6s  %s' "#" "ID" "Label" "Public IP" "Cloud" "Region" "SSH")"
+    emit "$(printf '%.0s-' {1..100})"
+
+    local n=0
+    while IFS=$'\t' read -r sid label ip cloud region; do
+        [[ -z "$sid" ]] && continue
+        n=$((n + 1))
+        local mark="" ssh_line="ssh master@${ip}"
+        [[ "$sid" == "$SERVER_ID" ]] && mark="*"
+        emit "$(printf '%-4s %-10s %-28s %-16s %-8s %-6s  %s' "$mark" "$sid" "$label" "$ip" "$cloud" "$region" "$ssh_line")"
+    done < <(echo "$json" | jq -r '.servers[]? |
+        [.id, (.label // "n/a"), (
+            if (.public_ip? // "") != "" then .public_ip
+            elif (.server_ips? | type) == "array" then (.server_ips[0] // "n/a")
+            else "n/a" end),
+         (.cloud // "-"), (.region // "-")] | @tsv')
+
+    emit ""
+    emit "* = this server (report above is for this one)"
+    emit "Run the same curl command on each remaining server."
+    emit ""
+    emit "Quick copy — server IPs only:"
+    echo "$json" | jq -r '.servers[]? |
+        (if (.public_ip? // "") != "" then .public_ip
+         elif (.server_ips? | type) == "array" then (.server_ips[0] // empty)
+         else empty end)' | while read -r ip; do
+        [[ -n "$ip" ]] && emit "  ${ip}"
+    done
 }
 
 # Per-log CPU + memory stats: CPU values to stdout; META line to stderr.
@@ -240,3 +308,5 @@ fi
 emit "================================================================================"
 emit "Notes: CPU% = user+sys from atop. Safe to share with customers."
 emit "================================================================================"
+
+emit_all_servers
