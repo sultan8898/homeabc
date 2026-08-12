@@ -28,6 +28,8 @@
 #   --quiet        Only write to --output file, not stdout
 #   --sleep S      Seconds between per-server API calls (default: 1)
 #   --server-id ID Only report one server (repeatable)
+#   --debug        Print API metadata and save raw JSON per server to /tmp
+#   --source api|atop-hint  Force data source notes (default: api)
 # =============================================================================
 
 set -euo pipefail
@@ -42,6 +44,7 @@ CSV=0
 OUTPUT=""
 QUIET=0
 SLEEP_BETWEEN=1
+DEBUG=0
 declare -a ONLY_SERVER_IDS=()
 
 while [[ $# -gt 0 ]]; do
@@ -57,6 +60,7 @@ while [[ $# -gt 0 ]]; do
         --quiet) QUIET=1; shift ;;
         --sleep) SLEEP_BETWEEN="$2"; shift 2 ;;
         --server-id) ONLY_SERVER_IDS+=("$2"); shift 2 ;;
+        --debug) DEBUG=1; shift ;;
         -h|--help)
             sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -106,7 +110,6 @@ pick_duration() {
     local json="$1"
     local picked
 
-    # Try common response shapes and match requested day count.
     picked=$(echo "$json" | jq -r --argjson days "$DAYS" '
         def rows:
             if type == "array" then .
@@ -116,14 +119,17 @@ pick_duration() {
             else [] end;
         rows
         | map(select(type == "object"))
+        | map(. + {
+            _label: ((.label? // .title? // .name? // .text? // "") | tostring),
+            _value: ((.value? // .id? // .key? // .duration? // .code? // "") | tostring)
+          })
         | map(select(
-            ((.days? // .day? // .value? // .id? // .key? // "") | tostring)
-            | test("^" + ($days|tostring) + "$")
-            or test("(?i)" + ($days|tostring) + "\\s*day")
-            or test("(?i)" + ($days|tostring) + "d")
+            ._label | test("(?i)" + ($days|tostring) + "\\s*day")
+            or ._value | test("(?i)" + ($days|tostring) + "\\s*day")
+            or ._value | test("(?i)last[_-]?" + ($days|tostring) + "[_-]?days?")
+            or ._value | test("(?i)^" + ($days|tostring) + "d$")
         ))
-        | .[0]
-        | (.value? // .id? // .key? // .duration? // empty)
+        | .[0]._value // empty
     ' 2>/dev/null || true)
 
     if [[ -n "$picked" && "$picked" != "null" ]]; then
@@ -131,69 +137,122 @@ pick_duration() {
         return 0
     fi
 
-    picked=$(echo "$json" | jq -r --argjson days "$DAYS" '
+    # Common Cloudways duration tokens seen in the wild.
+    case "$DAYS" in
+        1)  echo "last_24_hours" ;;
+        7)  echo "last_7_days" ;;
+        30) echo "last_30_days" ;;
+        *)  echo "last_${DAYS}_days" ;;
+    esac
+}
+
+pick_target() {
+    local json="$1"
+    local picked
+
+    picked=$(echo "$json" | jq -r '
         def rows:
             if type == "array" then .
-            elif (.durations? | type) == "array" then .durations
-            elif (.duration? | type) == "array" then .duration
+            elif (.targets? | type) == "array" then .targets
+            elif (.target? | type) == "array" then .target
             elif (.data? | type) == "array" then .data
             else [] end;
         rows
         | map(select(type == "object"))
-        | sort_by(-((.days? // .day? // 0) | tonumber? // 0))
-        | .[]
-        | select(((.days? // .day? // 0) | tonumber? // 0) <= $days)
-        | (.value? // .id? // .key? // .duration?)
-        ' 2>/dev/null | head -n 1 || true)
+        | map(. + {
+            _label: ((.label? // .title? // .name? // .text? // "") | tostring),
+            _value: ((.value? // .id? // .key? // .target? // .code? // "") | tostring)
+          })
+        | map(select(._label | test("(?i)cpu") or ._value | test("(?i)cpu")))
+        | .[0]._value // empty
+    ' 2>/dev/null || true)
 
     if [[ -n "$picked" && "$picked" != "null" ]]; then
         echo "$picked"
         return 0
     fi
-
-    # Last resort: literal patterns Cloudways has used in the past.
-    case "$DAYS" in
-        1) echo "1d" ;;
-        7) echo "7d" ;;
-        30) echo "30d" ;;
-        *) echo "${DAYS}d" ;;
-    esac
+    echo "cpu"
 }
 
 extract_cpu_values() {
-    # Accept several historical response shapes and return one number per line.
     jq -r '
-        def nums:
-            ..
-            | select(type == "number")
-            | select(. >= 0 and . <= 100);
-        def series:
-            if (.content? | type) == "array" then
-                .content[]
-                | if (.datapoint? | type) == "array" then .datapoint[]
-                  elif (.datapoints? | type) == "array" then .datapoints[]
-                  elif (.data? | type) == "array" then .data[]
-                  else empty end
-            elif (.datapoints? | type) == "array" then .datapoints[]
-            elif (.data? | type) == "array" then .data[]
-            elif (.graph? | type) == "array" then .graph[]
-            elif (.usage? | type) == "array" then .usage[]
+        def as_num:
+            if type == "number" then .
+            elif type == "string" then (tonumber? // empty)
             else empty end;
-        [
-            (series
-             | if type == "array" then
-                   if length >= 2 and (.[1] | type) == "number" then .[1]
-                   elif length >= 1 and (.[0] | type) == "number" then .[0]
-                   else empty end
-               elif type == "number" then .
-               else empty end),
-            (nums)
-        ]
-        | flatten
+        def from_leaf:
+            if type == "array" then
+                if length >= 2 then
+                    (.[1] | as_num) // (.[0] | as_num)
+                else .[] | from_leaf end
+            elif type == "object" then
+                (.y? // .value? // .usage? // .cpu? // .percent? | as_num)
+            else as_num end;
+        def walk:
+            if type == "array" then .[] | walk
+            elif type == "object" then
+                (.content?, .datapoint?, .datapoints?, .data?, .graph?, .usage?, .values?, .series?)
+                | walk,
+                (.series[]?.data? | walk)
+            else from_leaf end;
+        [walk]
         | map(select(type == "number"))
+        | map(if . > 0 and . <= 1 then . * 100 else . end)
+        | map(select(. >= 0 and . <= 100))
         | unique
         | .[]
     ' 2>/dev/null
+}
+
+duration_candidates() {
+    local primary="$1"
+    printf '%s\n' "$primary" "last_${DAYS}_days" "${DAYS}d" "${DAYS}" "2592000"
+}
+
+target_candidates() {
+    local primary="$1"
+    printf '%s\n' "$primary" "cpu" "CPU" "cpu_usage" "load"
+}
+
+fetch_cpu_json() {
+    local sid="$1" dur target url body
+
+    while IFS= read -r dur; do
+        [[ -z "$dur" ]] && continue
+        while IFS= read -r target; do
+            [[ -z "$target" ]] && continue
+
+            url="${API_V1}/server/monitor/detail?server_id=${sid}&target=${target}&duration=${dur}&timezone=${TIMEZONE}&output_format=json"
+            if body=$(api_get "$url" 2>/dev/null); then
+                if [[ "$(echo "$body" | extract_cpu_values | head -n1)" != "" ]]; then
+                    [[ "$DEBUG" -eq 1 ]] && echo "$body" > "/tmp/cw_cpu_${sid}_${target}_${dur}.json"
+                    echo "$body"
+                    return 0
+                fi
+                [[ "$DEBUG" -eq 1 ]] && echo "$body" > "/tmp/cw_cpu_${sid}_${target}_${dur}_empty.json"
+            fi
+
+            url="${API_V1}/server/monitor/summary?server_id=${sid}&type=${target}"
+            if body=$(api_get "$url" 2>/dev/null); then
+                if [[ "$(echo "$body" | extract_cpu_values | head -n1)" != "" ]]; then
+                    [[ "$DEBUG" -eq 1 ]] && echo "$body" > "/tmp/cw_cpu_${sid}_summary_${target}.json"
+                    echo "$body"
+                    return 0
+                fi
+            fi
+
+            url="${API_V2}/servers/${sid}/monitoring/graph?metric=${target}&duration=${dur}&timezone=${TIMEZONE}"
+            if body=$(api_get "$url" 2>/dev/null); then
+                if [[ "$(echo "$body" | extract_cpu_values | head -n1)" != "" ]]; then
+                    [[ "$DEBUG" -eq 1 ]] && echo "$body" > "/tmp/cw_cpu_${sid}_v2_${target}_${dur}.json"
+                    echo "$body"
+                    return 0
+                fi
+            fi
+        done < <(target_candidates "$TARGET")
+    done < <(duration_candidates "$DURATION")
+
+    echo '{}'
 }
 
 stats_from_values() {
@@ -235,8 +294,21 @@ TOKEN=$(api_token) || exit 1
 [[ -n "$TOKEN" ]] || { echo "Failed to obtain API token (empty response)." >&2; exit 1; }
 
 if [[ -z "$DURATION" ]]; then
-    DUR_JSON=$(api_get "${API_V1}/monitor_durations" || api_get "${API_V2}/monitoring/durations")
+    DUR_JSON=$(api_get "${API_V1}/monitor_durations" 2>/dev/null || api_get "${API_V2}/monitoring/durations")
     DURATION=$(pick_duration "$DUR_JSON")
+else
+    DUR_JSON='{}'
+fi
+
+TARGET_JSON=$(api_get "${API_V1}/monitor_targets" 2>/dev/null || api_get "${API_V2}/monitoring/targets" 2>/dev/null || echo '{}')
+TARGET=$(pick_target "$TARGET_JSON")
+
+if [[ "$DEBUG" -eq 1 ]]; then
+    echo "# duration=${DURATION} target=${TARGET}" >&2
+    echo "# monitor_durations:" >&2
+    echo "$DUR_JSON" | jq . >&2 2>/dev/null || echo "$DUR_JSON" >&2
+    echo "# monitor_targets:" >&2
+    echo "$TARGET_JSON" | jq . >&2 2>/dev/null || echo "$TARGET_JSON" >&2
 fi
 
 SERVERS_JSON=$(api_get "${API_V2}/server")
@@ -284,15 +356,7 @@ while IFS=$'\t' read -r sid label status cloud region; do
     [[ -z "$sid" ]] && continue
     TOTAL=$((TOTAL + 1))
 
-    DETAIL_URL="${API_V1}/server/monitor/detail?server_id=${sid}&target=${TARGET}&duration=${DURATION}&timezone=${TIMEZONE}&output_format=json"
-    DETAIL_JSON=""
-    if DETAIL_JSON=$(api_get "$DETAIL_URL" 2>/dev/null); then
-        :
-    else
-        DETAIL_URL="${API_V2}/servers/${sid}/monitoring/graph?metric=${TARGET}&duration=${DURATION}&timezone=${TIMEZONE}"
-        DETAIL_JSON=$(api_get "$DETAIL_URL" 2>/dev/null || echo '{}')
-    fi
-
+    DETAIL_JSON=$(fetch_cpu_json "$sid")
     VALUES=$(echo "$DETAIL_JSON" | extract_cpu_values || true)
     IFS=',' read -r samples avg max p95 result <<< "$(stats_from_values "$VALUES")"
 
@@ -326,6 +390,7 @@ if [[ "$CSV" -eq 0 ]]; then
   emit ""
   emit "Notes:"
   emit "- Percentages are computed from Cloudways monitoring graph datapoints."
+  emit "- If API shows no_data, run cpu_report_atop.sh ON each server (uses /var/log/atop)."
   emit "- Share this file directly with the customer, or use --csv for Excel/Sheets."
-  emit "- Re-run anytime; credentials are not stored by this script."
+  emit "- Re-run with --debug to save raw API JSON under /tmp/cw_cpu_*.json"
 fi
