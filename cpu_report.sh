@@ -74,10 +74,26 @@ command -v jq >/dev/null 2>&1 || { echo "jq is required." >&2; exit 1; }
 }
 
 api_token() {
-    curl -fsS --max-time 30 -X POST "${API_V2}/oauth/access_token" \
+    local body http_code
+    body=$(curl -sS --max-time 30 -w $'\n__HTTP_CODE__:%{http_code}' -X POST "${API_V2}/oauth/access_token" \
         -H "Content-Type: application/json" \
-        -d "{\"email\":\"${CW_EMAIL}\",\"api_key\":\"${CW_API_KEY}\"}" \
-        | jq -r '.access_token // empty'
+        -d "{\"email\":\"${CW_EMAIL}\",\"api_key\":\"${CW_API_KEY}\"}")
+    http_code="${body##*$'\n__HTTP_CODE__:'}"
+    body="${body%$'\n__HTTP_CODE__:'*}"
+
+    if [[ "$http_code" != "200" ]]; then
+        echo "Cloudways auth failed (HTTP ${http_code})." >&2
+        err=$(echo "$body" | jq -r '.error_description // .error // .message // empty' 2>/dev/null || true)
+        if [[ -n "$err" ]]; then
+            echo "$err" >&2
+        else
+            echo "$body" >&2
+        fi
+        echo "Check CW_EMAIL / CW_API_KEY in Cloudways: Account → API Credentials." >&2
+        return 1
+    fi
+
+    echo "$body" | jq -r '.access_token // empty'
 }
 
 api_get() {
@@ -215,8 +231,8 @@ emit() {
     fi
 }
 
-TOKEN=$(api_token)
-[[ -n "$TOKEN" ]] || { echo "Failed to obtain API token. Check CW_EMAIL / CW_API_KEY." >&2; exit 1; }
+TOKEN=$(api_token) || exit 1
+[[ -n "$TOKEN" ]] || { echo "Failed to obtain API token (empty response)." >&2; exit 1; }
 
 if [[ -z "$DURATION" ]]; then
     DUR_JSON=$(api_get "${API_V1}/monitor_durations" || api_get "${API_V2}/monitoring/durations")
