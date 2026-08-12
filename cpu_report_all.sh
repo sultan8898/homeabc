@@ -29,7 +29,8 @@ CSV=0
 QUIET=0
 DEBUG=0
 SSH_USER="${SSH_USER:-master}"
-SSH_HOST_MODE="${SSH_HOST_MODE:-ip}"   # ip | server_id | both
+SSH_HOST_MODE="${SSH_HOST_MODE:-both}"   # ip | server_id | both
+SSH_ALT_USERS=(root)                     # also try after SSH_USER
 SSH_KEY="${SSH_KEY:-}"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=25 -o StrictHostKeyChecking=accept-new)
 SLEEP_BETWEEN=2
@@ -134,54 +135,60 @@ run_atop_ssh() {
     local target="$1"
     local ssh_cmd=(ssh "${SSH_OPTS[@]}")
     [[ -n "$SSH_KEY" ]] && ssh_cmd+=(-i "$SSH_KEY")
-    ssh_cmd+=("$target" "bash -s $DAYS")
-    "${ssh_cmd[@]}" 2>&1 <<< "$(atop_stats_script)"
+    ssh_cmd+=("$target" "bash -s --" "$DAYS")
+    "${ssh_cmd[@]}" <<< "$(atop_stats_script)"
 }
 
 ssh_targets_for() {
-    local sid="$1" ip="$2"
-    case "$SSH_HOST_MODE" in
-        ip)
-            [[ -n "$ip" && "$ip" != "null" ]] && echo "${SSH_USER}@${ip}"
-            ;;
-        server_id)
-            echo "${SSH_USER}@${sid}"
-            ;;
-        both)
-            [[ -n "$ip" && "$ip" != "null" ]] && echo "${SSH_USER}@${ip}"
-            echo "${SSH_USER}@${sid}"
-            ;;
-        *) echo "${SSH_USER}@${ip}" ;;
-    esac
+    local sid="$1" ip="$2" user
+    for user in "$SSH_USER" "${SSH_ALT_USERS[@]}"; do
+        [[ -z "$user" ]] && continue
+        case "$SSH_HOST_MODE" in
+            ip)
+                [[ -n "$ip" && "$ip" != "null" ]] && echo "${user}@${ip}"
+                ;;
+            server_id)
+                echo "${user}@${sid}"
+                ;;
+            both)
+                [[ -n "$ip" && "$ip" != "null" ]] && echo "${user}@${ip}"
+                echo "${user}@${sid}"
+                ;;
+            *) [[ -n "$ip" && "$ip" != "null" ]] && echo "${user}@${ip}" ;;
+        esac
+    done
 }
 
 collect_server_stats() {
     local sid="$1" ip="$2"
-    local out target err
+    local out target err last_err=""
 
     if [[ -n "$LOCAL_SID" && "$sid" == "$LOCAL_SID" ]]; then
         dbg "server $sid: trying local atop"
-        if out=$(run_atop_local); then
+        if out=$(run_atop_local 2>&1) && [[ "$out" =~ samples= ]]; then
             echo "atop-local|$out"
             return 0
         fi
-        dbg "server $sid: local atop failed: $out"
+        dbg "server $sid: local atop failed: ${out:-empty}"
     fi
 
     while IFS= read -r target; do
         [[ -z "$target" ]] && continue
         dbg "server $sid: trying ssh $target"
         err=$(mktemp)
-        if out=$(run_atop_ssh "$target" 2>"$err"); then
+        out=""
+        if out=$(run_atop_ssh "$target" 2>"$err") && [[ "$out" =~ samples= ]]; then
             rm -f "$err"
             echo "atop-ssh|$out"
             return 0
         fi
-        dbg "server $sid: ssh $target failed: $(tr '\n' ' ' < "$err")"
+        last_err=$(tr '\n' ' ' < "$err")
+        [[ -z "$last_err" && -n "$out" ]] && last_err="$out"
+        dbg "server $sid: ssh $target failed: ${last_err:-connection failed}"
         rm -f "$err"
     done < <(ssh_targets_for "$sid" "$ip")
 
-    echo "no_data|"
+    echo "no_data|ssh_failed|${last_err:-no_ssh_access}"
     return 1
 }
 
@@ -189,7 +196,14 @@ parse_atop_output() {
     local source_line="$1"
     local source="${source_line%%|*}"
     local body="${source_line#*|}"
-    local samples avg max p95
+    local samples="" avg="" max="" p95="" ssh_err=""
+
+    if [[ "$body" == ssh_failed* ]]; then
+        ssh_err="${body#ssh_failed|}"
+        echo "0||||ssh_fail"
+        [[ "$DEBUG" -eq 1 && -n "$ssh_err" ]] && echo "#   ssh error: $ssh_err" >&2
+        return 0
+    fi
 
     if [[ "$body" =~ samples=([0-9]+) ]]; then
         samples="${BASH_REMATCH[1]}"
@@ -256,11 +270,11 @@ while IFS=$'\t' read -r sid label status cloud region ip; do
     raw=$(collect_server_stats "$sid" "$ip" || true)
     IFS='|' read -r samples avg max p95 result <<< "$(parse_atop_output "$raw")"
 
-    if [[ "$result" != "no_data" && -n "$samples" && "$samples" != "0" ]]; then
+    if [[ "$result" != "no_data" && "$result" != "ssh_fail" && -n "${samples:-}" && "$samples" != "0" ]]; then
         OK=$((OK + 1))
     else
         FAILED=$((FAILED + 1))
-        result="no_data"
+        [[ "$result" != "ssh_fail" ]] && result="no_data"
         samples="0"
     fi
 
@@ -287,8 +301,9 @@ if [[ "$CSV" -eq 0 ]]; then
     emit "----------------------------------------------------------------"
     emit ""
     emit "Notes:"
-    emit "- Re-run with --debug to see SSH targets and errors on stderr."
-    emit "- If master@IP fails, try: --ssh-user root --ssh-host server_id"
-    emit "- Whitelist your IP: Server → Master Credentials → SSH/SFTP."
-    emit "- cpu_report.sh on one server still works for that server only (atop fallback)."
+    emit "- Server 1235009 can only use local atop; other servers need SSH from YOUR laptop."
+    emit "- Cloudways servers usually cannot SSH to each other — run cpu_report_all from your PC."
+    emit "- Or run cpu_report_atop.sh on each server and merge the CSV rows."
+    emit "- Whitelist your IP on each server: Master Credentials → SSH/SFTP."
+    emit "- Test: ssh master@157.245.11.176  (should work from your machine before re-running)"
 fi
