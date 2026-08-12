@@ -122,12 +122,12 @@ emit_all_servers() {
     emit "Run the same curl command on each remaining server."
     emit ""
     emit "Quick copy — server IPs only:"
-    echo "$json" | jq -r '.servers[]? |
+    while IFS= read -r ip; do
+        [[ -n "$ip" ]] && emit "  ${ip}"
+    done < <(echo "$json" | jq -r '.servers[]? |
         (if (.public_ip? // "") != "" then .public_ip
          elif (.server_ips? | type) == "array" then (.server_ips[0] // empty)
-         else empty end)' | while read -r ip; do
-        [[ -n "$ip" ]] && emit "  ${ip}"
-    done
+         else empty end)')
 }
 
 # Per-log CPU + memory stats: CPU values to stdout; META line to stderr.
@@ -192,39 +192,29 @@ for log in "${SELECTED[@]}"; do
     analyze_log "$log" >> "$TMP_CPU" 2>> "$TMP_META"
 done
 
-read -r samples cpu_min cpu_avg cpu_med cpu_p95 cpu_p99 cpu_max cpu_max_at < <(
-    awk '
-      { v[NR] = $1 + 0; sum += $1; if ($1 < min || NR == 1) min = $1; if ($1 > max || NR == 1) { max = $1; max_i = NR } }
-      END {
-        n = NR
-        if (n == 0) { print "0 0 0 0 0 0 0 n/a"; exit }
-        asort(v)
-        med = v[int((n+1)/2)]
-        p95i = int(0.95*n); if (p95i < 1) p95i = 1
-        p99i = int(0.99*n); if (p99i < 1) p99i = 1
-        printf "%d %.2f %.2f %.2f %.2f %.2f %.2f %d\n", n, min, sum/n, med, v[p95i], v[p99i], max, max_i
-      }
-    ' "$TMP_CPU"
-)
+samples=$(wc -l < "$TMP_CPU" | tr -d ' ')
+if [[ "$samples" -eq 0 ]]; then
+    echo "No CPU samples found in atop logs." >&2
+    exit 1
+fi
 
-# Peak timestamp from per-day meta
-cpu_max_at=$(awk -F'cpu_max_at=' '{print $2}' "$TMP_META" 2>/dev/null | awk '{print $1, $2}' | head -n1)
-[[ -z "$cpu_max_at" || "$cpu_max_at" == "n/a" ]] && cpu_max_at="(see daily table)"
+cpu_min=$(awk 'BEGIN{min=1e9} {if($1<min)min=$1} END{printf "%.2f", min}' "$TMP_CPU")
+cpu_max=$(awk 'BEGIN{max=0} {if($1>max)max=$1} END{printf "%.2f", max}' "$TMP_CPU")
+cpu_avg=$(awk '{sum+=$1} END{printf "%.2f", sum/NR}' "$TMP_CPU")
+cpu_med=$(sort -n "$TMP_CPU" | awk -v n="$samples" 'BEGIN{m=int((n+1)/2); if(m<1)m=1} NR==m{printf "%.2f", $1; exit}')
+cpu_p95=$(sort -n "$TMP_CPU" | awk -v n="$samples" 'BEGIN{i=int(0.95*n); if(i<1)i=1} NR==i{printf "%.2f", $1; exit}')
+cpu_p99=$(sort -n "$TMP_CPU" | awk -v n="$samples" 'BEGIN{i=int(0.99*n); if(i<1)i=1} NR==i{printf "%.2f", $1; exit}')
 
-read -r mem_avg mem_max mem_max_at < <(
-    awk -F'[= ]' '
-      /mem_avg=/ {
-        for (i=1;i<=NF;i++) {
-          if ($i ~ /^mem_avg/) split($i,a,"="), ma+=a[2]
-          if ($i ~ /^mem_max/) split($i,a,"="), mm=a[2]
-          if ($i ~ /^mem_max_at/) maxat=$i; sub(/mem_max_at=/,"",maxat)
-        }
-      }
-      END {
-        printf "%.2f %.2f %s\n", (NR?ma/NR:0), (mm?mm:0), (maxat?maxat:"n/a")
-      }
-    ' "$TMP_META"
-)
+cpu_max_at=$(grep -F "cpu_max=${cpu_max}" "$TMP_META" 2>/dev/null | head -n1 \
+    | sed -n 's/.*cpu_max_at=\([^ ]* [^ ]*\).*/\1/p')
+[[ -z "$cpu_max_at" ]] && cpu_max_at="(see daily table)"
+
+mem_avg=$(grep -o 'mem_avg=[0-9.]*' "$TMP_META" 2>/dev/null | cut -d= -f2 \
+    | awk '{ s+=$1; n++ } END { printf "%.2f", (n ? s/n : 0) }')
+mem_max=$(grep -o 'mem_max=[0-9.]*' "$TMP_META" 2>/dev/null | cut -d= -f2 | sort -n | tail -n1)
+mem_max_at=$(grep -F "mem_max=${mem_max}" "$TMP_META" 2>/dev/null | head -n1 \
+    | sed -n 's/.*mem_max_at=\([^ ]* [^ ]*\).*/\1/p')
+[[ -z "$mem_max_at" ]] && mem_max_at="n/a"
 
 PUBLIC_IP=$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || echo "n/a")
 LOAD_AVG=$(awk '{print $1, $2, $3}' /proc/loadavg 2>/dev/null || echo "n/a")
