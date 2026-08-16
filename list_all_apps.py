@@ -15,14 +15,16 @@ Per-app disk breakdown (folder-level, like APM disk tab):
   python3 list_all_apps.py --breakdown --apps ffatvrgvnx,bxhqezvyyp --mode api
   python3 list_all_apps.py --breakdown --server 12345 --mode local
 
-Run on a Cloudways server (no download, all apps on this server, no API key):
+Run on a Cloudways server (no download, no API key — OAuth is blocked from server IP):
   curl -fsSL 'https://raw.githubusercontent.com/sultan8898/homeabc/main/list_all_apps.py' \\
-    | python3 - --breakdown --mode local
+    | python3 - --breakdown --apps nntrtuvbrv
 
-Run specific apps via API (from anywhere):
-  curl -fsSL 'https://raw.githubusercontent.com/sultan8898/homeabc/main/list_all_apps.py' \\
-    | CW_EMAIL='you@example.com' CW_API_KEY='your-key' python3 - \\
-      --mode api --apps ffatvrgvnx,bxhqezvyyp
+  # all apps on this server:
+  curl -fsSL '...' | python3 - --breakdown --mode local
+
+Run from cw-proxy / laptop with API (account-wide or other servers):
+  curl -fsSL '...' | CW_EMAIL='you@example.com' CW_API_KEY='your-key' python3 - \\
+    --mode api --breakdown --apps ffatvrgvnx
 
 Python 3.5+ (cw-proxy).
 """
@@ -50,7 +52,7 @@ if sys.version_info < (3, 5):
 API_V2 = "https://api.cloudways.com/api/v2"
 API_V1 = "https://api.cloudways.com/api/v1"
 TOKEN_TTL = 3600
-SCRIPT_BUILD = "app-disk-breakdown-v2"
+SCRIPT_BUILD = "app-disk-breakdown-v3"
 SCRIPT_RAW_URL = (
     "https://raw.githubusercontent.com/sultan8898/homeabc/"
     "cursor/app-disk-breakdown-c2aa/list_all_apps.py"
@@ -76,26 +78,40 @@ def fetch_token(email, api_key):
         return _token_cache["token"]
 
     print("  [token] Requesting new access token ...")
-    try:
-        resp = requests.post(
-            API_V2 + "/oauth/access_token",
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-            json={"email": email, "api_key": api_key},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        token = resp.json().get("access_token")
-        if not token:
-            print("[ERROR] No access_token in response: {}".format(resp.text[:300]))
-            sys.exit(1)
-    except requests.RequestException as e:
-        print("[ERROR] OAuth request failed: {}".format(e))
-        sys.exit(1)
+    last_err = None
+    for api_base in (API_V2, API_V1):
+        label = "v2" if api_base == API_V2 else "v1"
+        try:
+            resp = requests.post(
+                api_base + "/oauth/access_token",
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                json={"email": email, "api_key": api_key},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            token = resp.json().get("access_token")
+            if not token:
+                last_err = "No access_token in {} response: {}".format(
+                    label, resp.text[:300],
+                )
+                continue
+            _token_cache["token"] = token
+            _token_cache["expires_at"] = now + timedelta(seconds=TOKEN_TTL - 60)
+            print("  [token] Token obtained ({}).".format(label))
+            return token
+        except requests.RequestException as e:
+            last_err = "{} OAuth failed: {}".format(label, e)
+            continue
 
-    _token_cache["token"] = token
-    _token_cache["expires_at"] = now + timedelta(seconds=TOKEN_TTL - 60)
-    print("  [token] Token obtained.")
-    return token
+    print("[ERROR] OAuth request failed.")
+    if last_err:
+        print("  {}".format(last_err))
+    print("  On a Cloudways server, use live du (no API key):")
+    print("  {}".format(SCRIPT_CURL_LOCAL))
+    sys.exit(1)
 
 
 def auth_headers(token):
@@ -103,13 +119,21 @@ def auth_headers(token):
 
 
 def fetch_all_servers(token):
-    try:
-        resp = requests.get(API_V2 + "/server", headers=auth_headers(token), timeout=60)
-        resp.raise_for_status()
-        return resp.json().get("servers", [])
-    except requests.RequestException as e:
-        print("[ERROR] Failed to fetch server list: {}".format(e))
-        sys.exit(1)
+    last_err = None
+    for path in (API_V2 + "/server", API_V1 + "/server"):
+        try:
+            resp = requests.get(path, headers=auth_headers(token), timeout=60)
+            resp.raise_for_status()
+            body = resp.json()
+            servers = body.get("servers")
+            if servers is None and isinstance(body, list):
+                servers = body
+            return servers or []
+        except requests.RequestException as e:
+            last_err = e
+            continue
+    print("[ERROR] Failed to fetch server list: {}".format(last_err))
+    sys.exit(1)
 
 
 def detect_local_server_id():
@@ -166,14 +190,14 @@ def on_cloudways_server():
 
 
 def can_run_without_api(args, on_cw):
-    """Local breakdown on the app server needs no Cloudways API credentials."""
+    """On a Cloudways server, breakdown uses live du (API OAuth is often 403)."""
     if not on_cw:
         return False
-    if args.mode and args.mode != "local":
-        return False
-    if args.mode is None and not args.breakdown:
-        return False
-    return bool(args.breakdown or args.totals_only)
+    if args.breakdown or args.totals_only:
+        return True
+    if args.mode == "local":
+        return True
+    return False
 
 
 def run_local_server_breakdown(apps, server_id, top_n, totals_only, as_json):
@@ -1120,8 +1144,11 @@ def apply_on_server_defaults(args, on_cw, local_sid):
     """When run on a Cloudways server, default to all apps here + local du."""
     if not on_cw:
         return args
-    if args.breakdown and not args.mode:
-        args.mode = "local"
+    if args.breakdown or args.totals_only:
+        if args.mode == "api":
+            args.mode = "local"
+        elif not args.mode:
+            args.mode = "local"
     if args.this_server or (args.breakdown and not args.server and not args.apps):
         args.this_server = True
         if local_sid:
@@ -1262,11 +1289,15 @@ def main():
     if can_run_without_api(args, on_cw):
         apps = filter_local_apps(discover_local_apps(), app_filters)
         if not apps:
-            print("[ERROR] No apps found under /home/master/applications/.")
+            print("[ERROR] No apps matched under /home/master/applications/.")
+            if app_filters:
+                print("  Filter: {}".format(", ".join(app_filters)))
             sys.exit(1)
-        print("\n[local] Server {} — {} app(s) on this machine (no API)".format(
+        print("\n[local] Server {} — {} app(s) on this machine (live du, no API)".format(
             local_sid or "?", len(apps),
         ))
+        if os.environ.get("CW_EMAIL") or os.environ.get("CW_API_KEY"):
+            print("  (API credentials ignored on-server; OAuth is blocked from here.)")
         totals_only = args.totals_only or not args.breakdown
         run_local_server_breakdown(
             apps, local_sid, args.top, totals_only=totals_only, as_json=args.json,
