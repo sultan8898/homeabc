@@ -52,7 +52,7 @@ if sys.version_info < (3, 5):
 API_V2 = "https://api.cloudways.com/api/v2"
 API_V1 = "https://api.cloudways.com/api/v1"
 TOKEN_TTL = 3600
-SCRIPT_BUILD = "app-disk-breakdown-v4"
+SCRIPT_BUILD = "app-disk-breakdown-v5"
 SCRIPT_RAW_URL = (
     "https://raw.githubusercontent.com/sultan8898/homeabc/"
     "cursor/app-disk-breakdown-c2aa/list_all_apps.py"
@@ -200,7 +200,8 @@ def can_run_without_api(args, on_cw):
     return False
 
 
-def run_local_server_breakdown(apps, server_id, top_n, totals_only, as_json, debug=False):
+def run_local_server_breakdown(apps, server_id, top_n, totals_only, as_json,
+                               debug=False, depth=2):
     """Breakdown for all apps on this server using apm + du."""
     print("  Collecting sizes (bulk du + apm) ...")
     sizes = collect_sizes_local(apps, debug=debug)
@@ -222,7 +223,9 @@ def run_local_server_breakdown(apps, server_id, top_n, totals_only, as_json, deb
         if not totals_only:
             if total_apps > 3:
                 print("    [{}/{}] {} ...".format(idx, total_apps, su), flush=True)
-            folders = collect_app_breakdown_local(su, top_n=top_n, debug=debug)
+            folders = collect_app_breakdown_local(
+                su, top_n=top_n, depth=depth, debug=debug,
+            )
             app_rec["folders"] = [
                 {"path": f["path"], "size_mb": f["size_mb"],
                  "size": format_gib(f["size_mb"])}
@@ -1107,7 +1110,11 @@ def parse_folder_du_output(stdout):
             continue
         parts = line.split("\t")
         if len(parts) == 2:
-            path, size = parts[0].strip(), parts[1].strip()
+            left, right = parts[0].strip(), parts[1].strip()
+            if re.match(r"^[\d.]", left):
+                size, path = left, right
+            else:
+                path, size = left, right
         else:
             m = re.match(r"^(\S+)\s+(.+)$", line)
             if not m:
@@ -1122,13 +1129,121 @@ def parse_folder_du_output(stdout):
     return items
 
 
-def collect_app_breakdown_local(sys_user, top_n=10, debug=False):
-    items = run_apm_disk(sys_user, debug=debug)
+def is_public_html_path(path):
+    p = str(path or "").rstrip("/")
+    return p.endswith("/public_html") or p.endswith("public_html")
+
+
+def build_public_html_deep_du_script(sys_user, top_n, depth=2):
+    base = resolve_app_base(sys_user)
+    if not base:
+        return ""
+    ph = os.path.join(base, "public_html")
+    if not os.path.isdir(ph):
+        return ""
+    phq = shlex.quote(ph)
+    depth = max(1, min(int(depth), 6))
+    top_n = max(1, int(top_n))
+    extra = top_n + 3
+    return "\n".join([
+        "set +e",
+        "DU=/usr/bin/du",
+        '[ -x "$DU" ] || DU=du',
+        "PH={phq}".format(phq=phq),
+        '[ -d "$PH" ] || exit 0',
+        'OUT=$($DU -xh --max-depth={d} "$PH" 2>/dev/null | sort -hr | head -n {extra})'.format(
+            d=depth, extra=extra,
+        ),
+        'if [ -n "$OUT" ]; then printf "%s\\n" "$OUT"; exit 0; fi',
+        '$DU -h --max-depth={d} "$PH" 2>/dev/null | sort -hr | head -n {extra}'.format(
+            d=depth, extra=extra,
+        ),
+    ])
+
+
+def collect_public_html_deep_breakdown(sys_user, top_n, depth=2, debug=False):
+    """du --max-depth=N under public_html (wp-content, uploads, etc.)."""
+    base = resolve_app_base(sys_user)
+    if not base:
+        return []
+    ph = os.path.join(base, "public_html")
+    script = build_public_html_deep_du_script(sys_user, top_n, depth)
+    if not script:
+        return []
+    try:
+        result = run_subprocess(["bash", "-c", script], timeout=300)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        if debug:
+            print("  [debug] public_html du {}: {}".format(sys_user, exc))
+        return []
+    if debug and not (result.stdout or "").strip():
+        print("  [debug] public_html du {}: empty".format(sys_user))
+    return filter_public_html_du_items(result.stdout or "", ph, top_n)
+
+
+def filter_public_html_du_items(stdout, public_html_root, top_n):
+    root = os.path.normpath(public_html_root)
+    items = parse_folder_du_output(stdout)
+    filtered = []
+    for item in items:
+        path = os.path.normpath(item.get("path", ""))
+        if not path or path == root:
+            continue
+        if not path.startswith(root + os.sep):
+            continue
+        filtered.append(item)
+    return sort_breakdown_items(filtered)[:top_n]
+
+
+def collect_app_top_level_dirs(sys_user, debug=False):
+    """logs/tmp/private_html from apm; skip public_html (handled by deep du)."""
+    items = []
+    for item in run_apm_disk(sys_user, debug=debug):
+        path = item.get("path", "")
+        if is_public_html_path(path):
+            continue
+        items.append(item)
     if items:
-        return sort_breakdown_items(items)[:top_n]
+        return items
+    base = resolve_app_base(sys_user) or "/home/master/applications/{}".format(
+        sys_user,
+    )
+    bq = shlex.quote(base)
+    script = "\n".join([
+        "set +e", "DU=/usr/bin/du", '[ -x "$DU" ] || DU=du',
+        "base={}".format(bq),
+        'for d in "$base"/logs "$base"/tmp "$base"/private_html; do',
+        '  [ -d "$d" ] || continue',
+        '  sz=$($DU -sh "$d" 2>/dev/null | awk \'{print $1}\')',
+        '  [ -n "$sz" ] && echo -e "$sz\\t$d"',
+        "done",
+    ])
+    try:
+        result = run_subprocess(["bash", "-c", script], timeout=60)
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    return [i for i in parse_folder_du_output(result.stdout or "") if i.get("size_mb", 0) > 0.01]
+
+
+def collect_app_breakdown_local(sys_user, top_n=10, depth=2, debug=False):
+    """App dirs + deep public_html folder tree (wp-content/uploads, etc.)."""
+    if depth <= 0:
+        items = run_apm_disk(sys_user, debug=debug)
+        if items:
+            return sort_breakdown_items(items)[:top_n]
+    else:
+        items = collect_app_top_level_dirs(sys_user, debug=debug)
+        ph_items = collect_public_html_deep_breakdown(
+            sys_user, top_n=top_n, depth=depth, debug=debug,
+        )
+        items = merge_breakdown_items(ph_items, items)
+        if ph_items:
+            items = sort_breakdown_items(items)[:top_n]
+            if items:
+                return items
     script = build_app_folder_du_script(sys_user, top_n)
     try:
-        result = run_subprocess(["bash", "-s"], input_text=script, timeout=120)
+        result = run_subprocess(["bash", "-s"], input_text=script, timeout=180)
     except (subprocess.TimeoutExpired, OSError) as exc:
         if debug:
             print("  [debug] folder du {}: {}".format(sys_user, exc))
@@ -1137,7 +1252,7 @@ def collect_app_breakdown_local(sys_user, top_n=10, debug=False):
         print("  [debug] folder du {}: empty (base={})".format(
             sys_user, resolve_app_base(sys_user) or "?",
         ))
-    return parse_folder_du_output(result.stdout or "")
+    return sort_breakdown_items(parse_folder_du_output(result.stdout or ""))[:top_n]
 
 
 def collect_app_breakdown_remote(mode, server_ip, sys_user, top_n, ssh_user, cng_argv):
@@ -1241,7 +1356,7 @@ def filter_servers_apps(servers, server_id=None, app_filters=None):
 
 
 def collect_breakdown_for_app(token, server_id, app, size_mode, server_ip,
-                              ssh_user, cng_argv, top_n, debug=False):
+                              ssh_user, cng_argv, top_n, depth=2, debug=False):
     sys_user = str(app.get("sys_user", "")).strip()
     app_id = str(app.get("id", "")).strip()
     items = []
@@ -1251,7 +1366,9 @@ def collect_breakdown_for_app(token, server_id, app, size_mode, server_ip,
                 token, server_id, app_id, debug=debug,
             )
         if size_mode == "local":
-            items = collect_app_breakdown_local(sys_user, top_n=top_n)
+            items = collect_app_breakdown_local(
+                sys_user, top_n=top_n, depth=depth, debug=debug,
+            )
         elif size_mode in ("cng", "ssh"):
             items = collect_app_breakdown_remote(
                 size_mode, server_ip, sys_user, top_n, ssh_user, cng_argv,
@@ -1259,8 +1376,10 @@ def collect_breakdown_for_app(token, server_id, app, size_mode, server_ip,
         if size_mode == "api" and not items:
             local_sid = detect_local_server_id()
             if local_sid and str(server_id) == local_sid:
-                local_items = collect_app_breakdown_local(sys_user, top_n=top_n)
-                items = merge_breakdown_items(items, local_items)
+                local_items = collect_app_breakdown_local(
+                    sys_user, top_n=top_n, depth=depth, debug=debug,
+                )
+                items = merge_breakdown_items(local_items, items)
     return sort_breakdown_items(items)[:top_n]
 
 
@@ -1300,8 +1419,12 @@ def parse_cli_args(argv):
         help="Only apps on the current Cloudways server (auto when run on-server)",
     )
     parser.add_argument(
-        "--top", type=int, default=10, metavar="N",
-        help="Max folder lines per app in breakdown mode (default: 10)",
+        "--top", type=int, default=15, metavar="N",
+        help="Max folder lines per app (default: 15)",
+    )
+    parser.add_argument(
+        "--depth", type=int, default=2, metavar="N",
+        help="Folder depth under public_html (default: 2, e.g. wp-content/uploads)",
     )
     parser.add_argument(
         "--json", action="store_true",
@@ -1366,7 +1489,7 @@ def resolve_size_mode(args, on_cw):
 
 
 def run_breakdown_report(token, servers, size_mode, top_n, ssh_user, cng_argv,
-                         totals_only=False, as_json=False):
+                         totals_only=False, as_json=False, depth=2):
     debug = os.environ.get("MONITOR_DEBUG", "").strip() == "1"
     report = {"apps": []}
     for srv in servers:
@@ -1398,7 +1521,7 @@ def run_breakdown_report(token, servers, size_mode, top_n, ssh_user, cng_argv,
             if not totals_only:
                 folders = collect_breakdown_for_app(
                     token, sid, app, size_mode, ip, ssh_user, cng_argv,
-                    top_n, debug=debug,
+                    top_n, depth=depth, debug=debug,
                 )
                 app_rec["folders"] = [
                     {"path": f["path"], "size_mb": f["size_mb"],
@@ -1494,7 +1617,7 @@ def main():
         totals_only = args.totals_only or not args.breakdown
         run_local_server_breakdown(
             apps, local_sid, args.top, totals_only=totals_only, as_json=args.json,
-            debug=args.debug,
+            debug=args.debug, depth=args.depth,
         )
         if not args.json:
             print("=" * 60)
@@ -1540,6 +1663,7 @@ def main():
             token, servers, size_mode, args.top, ssh_user, cng_argv,
             totals_only=totals_only,
             as_json=args.json,
+            depth=args.depth,
         )
         if not args.json:
             print("=" * 60)
