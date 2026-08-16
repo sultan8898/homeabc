@@ -15,12 +15,16 @@ Per-app disk breakdown (folder-level, like APM disk tab):
   python3 list_all_apps.py --breakdown --apps ffatvrgvnx,bxhqezvyyp --mode api
   python3 list_all_apps.py --breakdown --server 12345 --mode local
 
-Python 3.5+ (cw-proxy).
+Run on a Cloudways server (no download, all apps on this server, no API key):
+  curl -fsSL 'https://raw.githubusercontent.com/sultan8898/homeabc/main/list_all_apps.py' \\
+    | python3 - --breakdown --mode local
 
-curl (pin by commit after push):
-  curl -fsSL -o /tmp/list_all_apps.py \\
-    'https://raw.githubusercontent.com/sultan8898/homeabc/<commit>/list_all_apps.py'
-  python3 /tmp/list_all_apps.py
+Run specific apps via API (from anywhere):
+  curl -fsSL 'https://raw.githubusercontent.com/sultan8898/homeabc/main/list_all_apps.py' \\
+    | CW_EMAIL='you@example.com' CW_API_KEY='your-key' python3 - \\
+      --mode api --apps ffatvrgvnx,bxhqezvyyp
+
+Python 3.5+ (cw-proxy).
 """
 
 import argparse
@@ -46,7 +50,18 @@ if sys.version_info < (3, 5):
 API_V2 = "https://api.cloudways.com/api/v2"
 API_V1 = "https://api.cloudways.com/api/v1"
 TOKEN_TTL = 3600
-SCRIPT_BUILD = "app-disk-breakdown-v1"
+SCRIPT_BUILD = "app-disk-breakdown-v2"
+SCRIPT_RAW_URL = (
+    "https://raw.githubusercontent.com/sultan8898/homeabc/"
+    "cursor/app-disk-breakdown-c2aa/list_all_apps.py"
+)
+SCRIPT_CURL_LOCAL = (
+    "curl -fsSL '{url}' | python3 - --breakdown --mode local".format(url=SCRIPT_RAW_URL)
+)
+SCRIPT_CURL_API = (
+    "curl -fsSL '{url}' | CW_EMAIL='you@example.com' CW_API_KEY='your-key' "
+    "python3 - --mode api --breakdown".format(url=SCRIPT_RAW_URL)
+)
 
 _token_cache = {"token": None, "expires_at": None}
 
@@ -108,6 +123,108 @@ def detect_local_server_id():
     except OSError:
         pass
     return ""
+
+
+def discover_local_apps():
+    """List every app on this Cloudways server from /home/master/applications."""
+    apps = []
+    seen = set()
+    for conf in sorted(glob.glob("/home/master/applications/*/conf/server.nginx")):
+        parts = conf.split("/")
+        try:
+            idx = parts.index("applications")
+            sys_user = parts[idx + 1]
+        except (ValueError, IndexError):
+            continue
+        if not sys_user or sys_user in seen or sys_user == "sample":
+            continue
+        seen.add(sys_user)
+        apps.append({
+            "sys_user": sys_user,
+            "label": sys_user,
+            "id": "",
+            "mysql_db_name": sys_user,
+        })
+    return apps
+
+
+def filter_local_apps(apps, app_filters):
+    if not app_filters:
+        return apps
+    lowered = [a.lower() for a in app_filters]
+    out = []
+    for app in apps:
+        su = str(app.get("sys_user", "")).strip().lower()
+        label = str(app.get("label", "")).strip().lower()
+        if su in lowered or label in lowered or any(f in su for f in lowered):
+            out.append(app)
+    return out
+
+
+def on_cloudways_server():
+    return bool(detect_local_server_id()) and os.path.isdir("/home/master/applications")
+
+
+def can_run_without_api(args, on_cw):
+    """Local breakdown on the app server needs no Cloudways API credentials."""
+    if not on_cw:
+        return False
+    if args.mode and args.mode != "local":
+        return False
+    if args.mode is None and not args.breakdown:
+        return False
+    return bool(args.breakdown or args.totals_only)
+
+
+def run_local_server_breakdown(apps, server_id, top_n, totals_only, as_json):
+    """Breakdown for all apps on this server using live du only."""
+    sizes = collect_sizes_local(apps)
+    report = {"server_id": server_id or "local", "apps": []}
+    for app in apps:
+        su = str(app.get("sys_user", "")).strip()
+        entry = sizes.get(su, {})
+        app_rec = {
+            "server_id": server_id or "local",
+            "server_ip": "localhost",
+            "app_id": "",
+            "app_label": str(app.get("label", su)),
+            "sys_user": su,
+            "files_size": entry.get("files_size", "n/a"),
+            "db_size": entry.get("db_size", "n/a"),
+            "folders": [],
+        }
+        if not totals_only:
+            folders = collect_app_breakdown_local(su, top_n=top_n)
+            app_rec["folders"] = [
+                {"path": f["path"], "size_mb": f["size_mb"],
+                 "size": format_gib(f["size_mb"])}
+                for f in folders
+            ]
+        report["apps"].append(app_rec)
+
+    if as_json:
+        print(json.dumps(report, indent=2))
+        return report
+
+    print("\n=== App disk breakdown (this server, live du) ===\n")
+    if len(report["apps"]) > 1:
+        print("App totals:")
+        render_app_totals_bar_chart(report["apps"])
+        print()
+    if totals_only:
+        return report
+
+    for rec in report["apps"]:
+        header = "{}  files={}  db={}".format(
+            rec["sys_user"], rec["files_size"], rec["db_size"],
+        )
+        print(header)
+        render_bar_chart(
+            [{"path": f["path"], "size_mb": f["size_mb"]} for f in rec["folders"]],
+            limit=top_n,
+        )
+        print()
+    return report
 
 
 def _looks_like_timestamp(v):
@@ -935,14 +1052,23 @@ def collect_breakdown_for_app(token, server_id, app, size_mode, server_ip,
 
 
 def parse_cli_args(argv):
+    epilog = (
+        "Run without downloading (on a Cloudways server, all apps, no API key):\n"
+        "  {local}\n\n"
+        "Run from anywhere with API (specific apps or account-wide):\n"
+        "  {api}\n\n"
+        "Omit --apps on a server to include every app on that machine."
+    ).format(local=SCRIPT_CURL_LOCAL, api=SCRIPT_CURL_API)
     parser = argparse.ArgumentParser(
         description="Cloudways app inventory with optional per-app disk breakdown.",
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--email", help="Cloudways account email (or CW_EMAIL)")
     parser.add_argument("--api-key", help="Cloudways API key (or CW_API_KEY)")
     parser.add_argument(
         "--mode", choices=["api", "local", "cng", "ssh", "skip"],
-        help="Size collection method (default: api, or local on a CW server)",
+        help="Size source: local=live du on this server (default with --breakdown here)",
     )
     parser.add_argument(
         "--breakdown", action="store_true",
@@ -950,9 +1076,16 @@ def parse_cli_args(argv):
     )
     parser.add_argument(
         "--apps", metavar="LIST",
-        help="Comma-separated sys_user, label, or app_id filter",
+        help="Comma-separated sys_user filter (default on server: all apps)",
     )
-    parser.add_argument("--server", metavar="ID", help="Limit to one server id")
+    parser.add_argument(
+        "--server", metavar="ID",
+        help="Limit to one server id (default on server: this server)",
+    )
+    parser.add_argument(
+        "--this-server", action="store_true",
+        help="Only apps on the current Cloudways server (auto when run on-server)",
+    )
     parser.add_argument(
         "--top", type=int, default=10, metavar="N",
         help="Max folder lines per app in breakdown mode (default: 10)",
@@ -963,22 +1096,37 @@ def parse_cli_args(argv):
     )
     parser.add_argument(
         "--totals-only", action="store_true",
-        help="With --apps: show ranked app totals only (no folder drill-down)",
+        help="Ranked /sys_user totals only (no per-folder drill-down)",
     )
     return parser.parse_args(argv)
 
 
-def resolve_credentials(args):
+def resolve_credentials(args, required=True):
     email = (args.email or os.environ.get("CW_EMAIL", "")).strip()
     api_key = (args.api_key or os.environ.get("CW_API_KEY", "")).strip()
-    if not email:
+    if not email and required:
         email = input("\nEmail address : ").strip()
-    if not api_key:
+    if not api_key and required:
         api_key = getpass.getpass("API key       : ").strip()
-    if not email or not api_key:
+    if required and (not email or not api_key):
         print("[ERROR] Email and API key are required.")
+        print("Set CW_EMAIL and CW_API_KEY, or run on-server with:")
+        print("  {}".format(SCRIPT_CURL_LOCAL))
         sys.exit(1)
     return email, api_key
+
+
+def apply_on_server_defaults(args, on_cw, local_sid):
+    """When run on a Cloudways server, default to all apps here + local du."""
+    if not on_cw:
+        return args
+    if args.breakdown and not args.mode:
+        args.mode = "local"
+    if args.this_server or (args.breakdown and not args.server and not args.apps):
+        args.this_server = True
+        if local_sid:
+            args.server = local_sid
+    return args
 
 
 def resolve_size_mode(args, on_cw):
@@ -1102,12 +1250,32 @@ def main():
     if args.apps:
         app_filters = [a.strip() for a in args.apps.split(",") if a.strip()]
 
+    local_sid = detect_local_server_id()
+    on_cw = on_cloudways_server()
+    args = apply_on_server_defaults(args, on_cw, local_sid)
+
     print("=" * 60)
     print("  Cloudways Account App Inventory (read-only)")
     print("  Python {}  build {}".format(sys.version.split()[0], SCRIPT_BUILD))
     print("=" * 60)
 
-    email, api_key = resolve_credentials(args)
+    if can_run_without_api(args, on_cw):
+        apps = filter_local_apps(discover_local_apps(), app_filters)
+        if not apps:
+            print("[ERROR] No apps found under /home/master/applications/.")
+            sys.exit(1)
+        print("\n[local] Server {} — {} app(s) on this machine (no API)".format(
+            local_sid or "?", len(apps),
+        ))
+        totals_only = args.totals_only or not args.breakdown
+        run_local_server_breakdown(
+            apps, local_sid, args.top, totals_only=totals_only, as_json=args.json,
+        )
+        if not args.json:
+            print("=" * 60)
+        return
+
+    email, api_key = resolve_credentials(args, required=True)
     print()
     token = fetch_token(email, api_key)
     print("\n[1] Fetching server + app list ...")
@@ -1121,7 +1289,6 @@ def main():
         sum(len(s.get("apps", [])) for s in servers),
     ))
 
-    local_sid = detect_local_server_id()
     on_cw = bool(local_sid)
     size_mode = resolve_size_mode(args, on_cw)
     if size_mode == "cng" and not shutil.which("cng"):
