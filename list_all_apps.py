@@ -52,7 +52,7 @@ if sys.version_info < (3, 5):
 API_V2 = "https://api.cloudways.com/api/v2"
 API_V1 = "https://api.cloudways.com/api/v1"
 TOKEN_TTL = 3600
-SCRIPT_BUILD = "app-disk-breakdown-v3"
+SCRIPT_BUILD = "app-disk-breakdown-v4"
 SCRIPT_RAW_URL = (
     "https://raw.githubusercontent.com/sultan8898/homeabc/"
     "cursor/app-disk-breakdown-c2aa/list_all_apps.py"
@@ -200,11 +200,13 @@ def can_run_without_api(args, on_cw):
     return False
 
 
-def run_local_server_breakdown(apps, server_id, top_n, totals_only, as_json):
-    """Breakdown for all apps on this server using live du only."""
-    sizes = collect_sizes_local(apps)
+def run_local_server_breakdown(apps, server_id, top_n, totals_only, as_json, debug=False):
+    """Breakdown for all apps on this server using apm + du."""
+    print("  Collecting sizes (bulk du + apm) ...")
+    sizes = collect_sizes_local(apps, debug=debug)
     report = {"server_id": server_id or "local", "apps": []}
-    for app in apps:
+    total_apps = len(apps)
+    for idx, app in enumerate(apps, 1):
         su = str(app.get("sys_user", "")).strip()
         entry = sizes.get(su, {})
         app_rec = {
@@ -218,7 +220,9 @@ def run_local_server_breakdown(apps, server_id, top_n, totals_only, as_json):
             "folders": [],
         }
         if not totals_only:
-            folders = collect_app_breakdown_local(su, top_n=top_n)
+            if total_apps > 3:
+                print("    [{}/{}] {} ...".format(idx, total_apps, su), flush=True)
+            folders = collect_app_breakdown_local(su, top_n=top_n, debug=debug)
             app_rec["folders"] = [
                 {"path": f["path"], "size_mb": f["size_mb"],
                  "size": format_gib(f["size_mb"])}
@@ -634,23 +638,91 @@ def collect_sizes_api_for_server(token, server_id, apps):
     return sizes
 
 
+def build_bulk_du_script():
+    """One-pass du for all app homes + mysql datadirs (Cloudways paths)."""
+    return "\n".join([
+        "set +e",
+        "DU=/usr/bin/du",
+        '[ -x "$DU" ] || DU=du',
+        '_emit() {',
+        '  local kind="$1" name="$2" kb="$3"',
+        '  [ -n "$name" ] && [ -n "$kb" ] && printf "%s\\t%s\\t%sK\\n" "$kind" "$name" "$kb"',
+        '}',
+        '_scan_apps() {',
+        '  local base="$1" strip="$2"',
+        '  [ -d "$base" ] || return 0',
+        '  local d name su kb',
+        '  for d in "$base"/*; do',
+        '    [ -d "$d" ] || continue',
+        '    name=$(basename "$d")',
+        '    case "$name" in sample|master|lost+found|.*) continue ;; esac',
+        '    su="$name"',
+        '    if [ "$strip" = "1" ]; then su="${su%.cloudwaysapps.com}"; fi',
+        '    kb=$("$DU" -sk "$d" 2>/dev/null | awk "{print \\$1}")',
+        '    _emit F "$su" "$kb"',
+        '  done',
+        '}',
+        '_scan_apps /home/master/applications 0',
+        '_scan_apps /home 1',
+        'if [ -d /var/lib/mysql ]; then',
+        '  for d in /var/lib/mysql/*; do',
+        '    [ -d "$d" ] || continue',
+        '    name=$(basename "$d")',
+        '    kb=$("$DU" -sk "$d" 2>/dev/null | awk "{print \\$1}")',
+        '    _emit D "$name" "$kb"',
+        '  done',
+        'fi',
+    ])
+
+
+def parse_bulk_du_output(stdout):
+    sizes = {}
+    for line in (stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        kind, name, raw = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        if not name or not raw:
+            continue
+        mb = parse_human_size_to_mb(raw)
+        if mb is None:
+            continue
+        disp = format_mb_display(mb)
+        sizes.setdefault(name, {})
+        if kind == "F":
+            sizes[name]["files_size"] = disp
+        elif kind == "D":
+            sizes[name]["db_size"] = disp
+    for ent in sizes.values():
+        ent.setdefault("files_size", "n/a")
+        ent.setdefault("db_size", "n/a")
+    return sizes
+
+
 def build_per_app_du_script(apps):
-    lines = ["set +e"]
+    """Per-app du fallback when bulk scan misses an app."""
+    lines = ["set +e", "DU=/usr/bin/du", '[ -x "$DU" ] || DU=du']
     for app in apps:
         sys_user = str(app.get("sys_user", "")).strip()
         if not sys_user:
             continue
         db_name = str(app.get("mysql_db_name", "") or sys_user).strip()
-        app_dir = "/home/master/applications/{}".format(sys_user)
+        bases = [
+            "/home/master/applications/{}".format(sys_user),
+            "/home/{}.cloudwaysapps.com".format(sys_user),
+        ]
         db_dir = "/var/lib/mysql/{}".format(db_name)
         su = shlex.quote(sys_user)
-        ad = shlex.quote(app_dir)
         dd = shlex.quote(db_dir)
+        ad_list = " ".join(shlex.quote(b) for b in bases)
         lines.append(
-            "fu=$(du -sch {ad} 2>/dev/null | awk '/^total/{{print $1}}'); "
-            "db=$(du -sch {dd} 2>/dev/null | awk '/^total/{{print $1}}'); "
+            "fu=\"\"; for ad in {ads}; do "
+            "[ -d \"$ad\" ] || continue; "
+            "fu=$($DU -sh \"$ad\" 2>/dev/null | awk '{{print $1}}'); "
+            "[ -n \"$fu\" ] && break; done; "
+            "db=$($DU -sh {dd} 2>/dev/null | awk '{{print $1}}'); "
             "printf '%s\\t%s\\t%s\\n' {su} \"$fu\" \"$db\"".format(
-                ad=ad, dd=dd, su=su,
+                ads=ad_list, dd=dd, su=su,
             )
         )
     return "\n".join(lines)
@@ -707,14 +779,41 @@ def run_remote_script(mode, server_ip, script, ssh_user, cng_argv):
     return out, True, err
 
 
-def collect_sizes_local(apps):
-    script = build_per_app_du_script(apps)
+def collect_sizes_local(apps, debug=False):
+    sizes = {}
     try:
-        result = run_subprocess(["bash", "-s"], input_text=script)
-    except (subprocess.TimeoutExpired, OSError) as e:
-        print("  [warn] local du failed: {}".format(e))
-        return {}
-    return parse_du_output(result.stdout or "")
+        result = run_subprocess(["bash", "-c", build_bulk_du_script()], timeout=600)
+        if debug and (result.stderr or "").strip():
+            print("  [debug] bulk du stderr: {}".format(
+                (result.stderr or "").strip()[:300],
+            ))
+        sizes = parse_bulk_du_output(result.stdout or "")
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        if debug:
+            print("  [debug] bulk du failed: {}".format(exc))
+
+    if not sizes:
+        try:
+            script = build_per_app_du_script(apps)
+            result = run_subprocess(["bash", "-s"], input_text=script, timeout=600)
+            sizes = parse_du_output(result.stdout or "")
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            if debug:
+                print("  [debug] per-app du failed: {}".format(exc))
+            sizes = {}
+
+    for app in apps:
+        su = str(app.get("sys_user", "")).strip()
+        if not su:
+            continue
+        ent = sizes.setdefault(su, {"files_size": "n/a", "db_size": "n/a"})
+        if ent.get("files_size") not in (None, "", "n/a"):
+            continue
+        items = run_apm_disk(su, debug=debug)
+        total_mb = sum_breakdown_mb(items)
+        if total_mb is not None:
+            ent["files_size"] = format_mb_display(total_mb)
+    return sizes
 
 
 def collect_sizes_remote(mode, server_ip, apps, ssh_user, cng_argv):
@@ -799,10 +898,13 @@ def format_gib(mb):
 
 
 def parse_human_size_to_mb(text):
-    """Convert du output like 2.5G, 1800M, 1.2G to MB."""
+    """Convert du/apm output like 2.5G, 1800M, 2560K to MB."""
     if not text or text == "n/a":
         return None
     text = str(text).strip().upper()
+    m = re.match(r"^(\d+(?:\.\d+)?)K$", text)
+    if m:
+        return float(m.group(1)) / 1024.0
     m = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*([KMGTPE]?)(?:I?B)?$", text)
     if not m:
         return None
@@ -810,6 +912,80 @@ def parse_human_size_to_mb(text):
     unit = m.group(2) or "K"
     mult = {"K": 1.0 / 1024.0, "M": 1.0, "G": 1024.0, "T": 1024.0 * 1024.0}
     return val * mult.get(unit, 1.0)
+
+
+APM_DISK_LINE = re.compile(
+    r"^\s*([\d.]+)\s+(GiB|MiB|KiB|TiB|G|M|K)\s+\[[# ]+\]\s+(/[^\s]*)\s*$",
+    re.IGNORECASE,
+)
+
+
+def apm_unit_to_mb(val, unit):
+    u = str(unit).lower().replace("ib", "").replace("b", "")
+    if u in ("g",):
+        return float(val) * 1024.0
+    if u in ("m",):
+        return float(val)
+    if u in ("k",):
+        return float(val) / 1024.0
+    if u in ("t",):
+        return float(val) * 1024.0 * 1024.0
+    return float(val)
+
+
+def apm_binary():
+    for candidate in ("/usr/local/sbin/apm", shutil.which("apm") or ""):
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return ""
+
+
+def parse_apm_disk_output(stdout):
+    items = []
+    for line in (stdout or "").splitlines():
+        m = APM_DISK_LINE.match(line.strip())
+        if not m:
+            continue
+        items.append({
+            "path": m.group(3).strip(),
+            "size_mb": apm_unit_to_mb(m.group(1), m.group(2)),
+        })
+    return items
+
+
+def run_apm_disk(sys_user, debug=False):
+    """Cloudways APM disk breakdown (/usr/local/sbin/apm -s USER -d)."""
+    apm = apm_binary()
+    if not apm:
+        return []
+    try:
+        result = run_subprocess([apm, "-s", sys_user, "-d"], timeout=180)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        if debug:
+            print("  [debug] apm {}: {}".format(sys_user, exc))
+        return []
+    if debug and (result.stderr or "").strip():
+        print("  [debug] apm {} stderr: {}".format(
+            sys_user, (result.stderr or "").strip()[:200],
+        ))
+    if result.returncode != 0 and not (result.stdout or "").strip():
+        return []
+    return parse_apm_disk_output(result.stdout)
+
+
+def resolve_app_base(sys_user):
+    for base in (
+        "/home/master/applications/{}".format(sys_user),
+        "/home/{}.cloudwaysapps.com".format(sys_user),
+    ):
+        if os.path.isdir(base):
+            return base
+    return ""
+
+
+def sum_breakdown_mb(items):
+    total = sum((i.get("size_mb") or 0) for i in (items or []))
+    return total if total > 0 else None
 
 
 def content_to_breakdown_items(content):
@@ -901,18 +1077,22 @@ def fetch_app_disk_breakdown_api(token, server_id, app_id, debug=False):
 
 
 def build_app_folder_du_script(sys_user, top_n):
-    base = "/home/master/applications/{}".format(sys_user)
+    base = resolve_app_base(sys_user) or "/home/master/applications/{}".format(
+        sys_user,
+    )
     bq = shlex.quote(base)
-    ph = shlex.quote(base + "/public_html")
+    ph = shlex.quote(os.path.join(base, "public_html"))
     lines = [
         "set +e",
+        "DU=/usr/bin/du",
+        '[ -x "$DU" ] || DU=du',
         "base={bq}".format(bq=bq),
-        "for d in \"$base\"/public_html \"$base\"/logs \"$base\"/tmp \"$base\"/private_html; do".format(),
-        "  [ -d \"$d\" ] || continue",
-        "  sz=$(du -sch \"$d\" 2>/dev/null | awk '/^total/{{print $1}}')",
-        "  [ -n \"$sz\" ] && printf '%s\\t%s\\n' \"$d\" \"$sz\"",
+        'for d in "$base"/public_html "$base"/logs "$base"/tmp "$base"/private_html; do',
+        '  [ -d "$d" ] || continue',
+        '  sz=$($DU -sh "$d" 2>/dev/null | awk \'{print $1}\')',
+        '  [ -n "$sz" ] && printf "%s\\t%s\\n" "$d" "$sz"',
         "done",
-        "du -sch {ph}/.[!.]* {ph}/* 2>/dev/null | grep -v '^total' | sort -hr | head -n {top}".format(
+        "$DU -sh {ph}/.[!.]* {ph}/* 2>/dev/null | sort -hr | head -n {top}".format(
             ph=ph, top=int(top_n),
         ),
     ]
@@ -942,12 +1122,21 @@ def parse_folder_du_output(stdout):
     return items
 
 
-def collect_app_breakdown_local(sys_user, top_n=10):
+def collect_app_breakdown_local(sys_user, top_n=10, debug=False):
+    items = run_apm_disk(sys_user, debug=debug)
+    if items:
+        return sort_breakdown_items(items)[:top_n]
     script = build_app_folder_du_script(sys_user, top_n)
     try:
-        result = run_subprocess(["bash", "-s"], input_text=script)
-    except (subprocess.TimeoutExpired, OSError):
+        result = run_subprocess(["bash", "-s"], input_text=script, timeout=120)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        if debug:
+            print("  [debug] folder du {}: {}".format(sys_user, exc))
         return []
+    if debug and not (result.stdout or "").strip():
+        print("  [debug] folder du {}: empty (base={})".format(
+            sys_user, resolve_app_base(sys_user) or "?",
+        ))
     return parse_folder_du_output(result.stdout or "")
 
 
@@ -1122,6 +1311,10 @@ def parse_cli_args(argv):
         "--totals-only", action="store_true",
         help="Ranked /sys_user totals only (no per-folder drill-down)",
     )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Show du/apm diagnostics when sizes are missing",
+    )
     return parser.parse_args(argv)
 
 
@@ -1293,7 +1486,7 @@ def main():
             if app_filters:
                 print("  Filter: {}".format(", ".join(app_filters)))
             sys.exit(1)
-        print("\n[local] Server {} — {} app(s) on this machine (live du, no API)".format(
+        print("\n[local] Server {} — {} app(s) on this machine (apm + du, no API)".format(
             local_sid or "?", len(apps),
         ))
         if os.environ.get("CW_EMAIL") or os.environ.get("CW_API_KEY"):
@@ -1301,6 +1494,7 @@ def main():
         totals_only = args.totals_only or not args.breakdown
         run_local_server_breakdown(
             apps, local_sid, args.top, totals_only=totals_only, as_json=args.json,
+            debug=args.debug,
         )
         if not args.json:
             print("=" * 60)
