@@ -17,9 +17,22 @@ Flow:
 - Polls each operation to completion before the next app
 - failed_apps.txt / completed_apps.txt; re-run skips completed apps
 - Verify on-server after run: /etc/ansible/facts.d/wp_cron.fact
+
+Non-interactive (all servers):
+    CW_EMAIL='you@example.com' CW_API_KEY='your-key' \\
+      python3 sl_enable_cronoptimizer.py --all-servers
+
+Non-interactive (one server):
+    CW_EMAIL='you@example.com' CW_API_KEY='your-key' \\
+      python3 sl_enable_cronoptimizer.py --server 1223032
+
+Note: piping credentials via printf does NOT work — getpass reads /dev/tty.
+Use env vars or --email / --api-key instead.
 """
 
+import argparse
 import glob
+import os
 import re
 import sys
 import time
@@ -113,23 +126,20 @@ def detect_server_id() -> str:
 
 
 # ── App discovery via API ─────────────────────────────────────────────────────
-def get_apps_for_server(server_id: str, token: str) -> list:
-    """Return eligible apps [{app_id, label, application}] for server_id."""
+def fetch_servers(token: str) -> list:
     try:
         resp = requests.get(f"{API_BASE}/server", headers=auth_headers(token), timeout=60)
         resp.raise_for_status()
-        servers = resp.json().get("servers", [])
+        return resp.json().get("servers", [])
     except requests.RequestException as e:
         print(f"[ERROR] Failed to fetch server list: {e}")
         sys.exit(1)
 
-    target = next((s for s in servers if str(s.get("id")) == str(server_id)), None)
-    if target is None:
-        print(f"[ERROR] Server ID {server_id} not found on this account.")
-        sys.exit(1)
 
+def list_eligible_apps(server: dict) -> list:
+    """Return eligible apps [{app_id, label, application, sys_user}] for one server."""
     apps = []
-    for app in target.get("apps", []):
+    for app in server.get("apps", []):
         app_type = str(app.get("application", "")).lower()
         if app_type not in ELIGIBLE_TYPES:
             print(f"  [skip] {app.get('label','?')} (type={app_type})")
@@ -144,6 +154,16 @@ def get_apps_for_server(server_id: str, token: str) -> list:
             "sys_user":    str(app.get("sys_user", "")),
         })
     return apps
+
+
+def get_apps_for_server(server_id: str, token: str) -> list:
+    """Return eligible apps for server_id (fetches account server list)."""
+    servers = fetch_servers(token)
+    target = next((s for s in servers if str(s.get("id")) == str(server_id)), None)
+    if target is None:
+        print(f"[ERROR] Server ID {server_id} not found on this account.")
+        sys.exit(1)
+    return list_eligible_apps(target)
 
 
 # ── Resume support ────────────────────────────────────────────────────────────
@@ -277,36 +297,79 @@ def log_success(server_id: str, app: dict):
                 f"label={app['label']}\n")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-def main():
-    print("=" * 60)
-    print("  Cloudways Cron Optimizer Bulk Enabler (v1 API)")
-    print("=" * 60)
+def parse_cli_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Enable Cloudways Cron Optimizer for WordPress apps (v1 API).",
+        epilog=(
+            "Examples:\n"
+            "  CW_EMAIL=you@example.com CW_API_KEY=key python3 %(prog)s --all-servers\n"
+            "  CW_EMAIL=you@example.com CW_API_KEY=key python3 %(prog)s --server 1223032\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--email", help="Cloudways account email (or CW_EMAIL)")
+    parser.add_argument("--api-key", help="Cloudways API key (or CW_API_KEY)")
+    parser.add_argument("--server", metavar="ID", help="Single server id to process")
+    parser.add_argument(
+        "--all-servers", action="store_true",
+        help="Process every server in the account (non-interactive with credentials)",
+    )
+    return parser.parse_args(argv)
 
-    email   = input("\nEmail address : ").strip()
-    api_key = getpass.getpass("API key       : ").strip()
+
+def resolve_credentials(args):
+    email = (args.email or os.environ.get("CW_EMAIL", "")).strip()
+    api_key = (args.api_key or os.environ.get("CW_API_KEY", "")).strip()
+    if not email:
+        email = input("\nEmail address : ").strip()
+    if not api_key:
+        api_key = getpass.getpass("API key       : ").strip()
     if not email or not api_key:
         print("[ERROR] Email and API key are required.")
+        print("Set CW_EMAIL and CW_API_KEY, or pass --email and --api-key.")
         sys.exit(1)
+    return email, api_key
+
+
+def resolve_target_servers(args, token: str) -> list:
+    if args.all_servers and args.server:
+        print("[ERROR] Use either --all-servers or --server, not both.")
+        sys.exit(1)
+
+    servers = fetch_servers(token)
+    if args.all_servers:
+        return servers
 
     detected = detect_server_id()
-    prompt   = f"Server ID [{detected}] : " if detected else "Server ID     : "
-    server_id = input(prompt).strip() or detected
+    server_id = (args.server or "").strip()
     if not server_id:
-        print("[ERROR] Server ID is required.")
+        prompt = f"Server ID [{detected}] : " if detected else "Server ID     : "
+        server_id = input(prompt).strip() or detected
+    if not server_id:
+        print("[ERROR] Server ID is required (or pass --all-servers).")
         sys.exit(1)
 
-    print()
-    token = fetch_token(email, api_key)
+    target = next((s for s in servers if str(s.get("id")) == str(server_id)), None)
+    if target is None:
+        print(f"[ERROR] Server ID {server_id} not found on this account.")
+        sys.exit(1)
+    return [target]
+
+
+def run_for_server(server: dict, email: str, api_key: str, token: str) -> tuple:
+    server_id = str(server.get("id", ""))
+    label = str(server.get("label", ""))
+    print("\n" + "=" * 60)
+    print(f"  Server {server_id} ({label})")
+    print("=" * 60)
 
     print(f"\n[1] Fetching apps for server {server_id} via API ...")
-    apps = get_apps_for_server(server_id, token)
+    apps = list_eligible_apps(server)
     if not apps:
-        print("[ERROR] No eligible WordPress apps found on this server.")
-        sys.exit(1)
+        print("    No eligible WordPress apps on this server — skipping.")
+        return 0, 0, 0
 
     done = load_completed()
-
     fact_enabled = load_fact_enabled()
     if not WP_CRON_FACT.exists():
         print("    [note] wp_cron.fact not found (script not on target "
@@ -321,7 +384,7 @@ def main():
         if a["sys_user"] and a["sys_user"] in fact_enabled:
             print(f"  [skip] {a['label']} (app_id={a['app_id']}, "
                   f"sys_user={a['sys_user']}) -- already enabled per wp_cron.fact")
-            log_success(server_id, a)  # record so future runs skip via log too
+            log_success(server_id, a)
             skipped_fact += 1
             continue
         pending.append(a)
@@ -332,11 +395,10 @@ def main():
           f"{len(pending)} to process.\n")
 
     if not pending:
-        print("Nothing to do. Delete completed_apps.txt to force a full re-run.")
-        return
+        print("    Nothing to do on this server.")
+        return 0, 0, skipped
 
     failed = success = 0
-
     for idx, app in enumerate(pending, 1):
         app_id = app["app_id"]
         print(f"[{idx}/{len(pending)}] {app['label']} (app_id={app_id}, "
@@ -367,10 +429,35 @@ def main():
 
         time.sleep(RATE_SLEEP)
 
+    print(f"  Server {server_id} done: {success} succeeded, {failed} failed, "
+          f"{skipped} skipped")
+    return success, failed, skipped
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    args = parse_cli_args(sys.argv[1:])
+
     print("=" * 60)
-    print(f"  Finished:  {success} succeeded,  {failed} failed,  "
-          f"{skipped} skipped (already done)")
-    if failed:
+    print("  Cloudways Cron Optimizer Bulk Enabler (v1 API)")
+    print("=" * 60)
+
+    email, api_key = resolve_credentials(args)
+    print()
+    token = fetch_token(email, api_key)
+    targets = resolve_target_servers(args, token)
+
+    total_success = total_failed = total_skipped = 0
+    for server in targets:
+        success, failed, skipped = run_for_server(server, email, api_key, token)
+        total_success += success
+        total_failed += failed
+        total_skipped += skipped
+
+    print("\n" + "=" * 60)
+    print(f"  Finished ({len(targets)} server(s)):  {total_success} succeeded,  "
+          f"{total_failed} failed,  {total_skipped} skipped")
+    if total_failed:
         print(f"  Failed apps logged to:    {FAILED_LOG.resolve()}")
     print(f"  Completed apps logged to: {COMPLETED_LOG.resolve()}")
     print("  Verify on server: cat /etc/ansible/facts.d/wp_cron.fact")
