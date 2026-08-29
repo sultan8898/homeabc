@@ -52,7 +52,7 @@ if sys.version_info < (3, 5):
 API_V2 = "https://api.cloudways.com/api/v2"
 API_V1 = "https://api.cloudways.com/api/v1"
 TOKEN_TTL = 3600
-SCRIPT_BUILD = "app-disk-breakdown-v5"
+SCRIPT_BUILD = "app-disk-breakdown-v6"
 SCRIPT_RAW_URL = (
     "https://raw.githubusercontent.com/sultan8898/homeabc/"
     "cursor/app-disk-breakdown-c2aa/list_all_apps.py"
@@ -839,6 +839,16 @@ def app_url(app):
     return str(app.get("app_fqdn", "") or app.get("url", "") or "").strip()
 
 
+def app_db_name(app):
+    """MySQL database name for the app (Cloudways API: mysql_db_name)."""
+    sys_user = str(app.get("sys_user", "")).strip()
+    for key in ("mysql_db_name", "db_name", "mysql_db", "database_name"):
+        val = str(app.get(key, "") or "").strip()
+        if val:
+            return val
+    return sys_user
+
+
 def server_location(srv):
     provider = str(srv.get("cloud", "") or srv.get("provider", "") or "").strip()
     region = str(
@@ -1580,6 +1590,7 @@ def collect_rows(servers, sizes_by_server):
                 "app_type": str(app.get("application", "")),
                 "app_url": app_url(app),
                 "sys_user": sys_user,
+                "db_name": app_db_name(app),
                 "is_staging": "yes" if str(app.get("is_staging", "0")) == "1" else "no",
                 "files_size": files_sz,
                 "db_size": db_sz,
@@ -1738,7 +1749,7 @@ def main():
     if rows:
         headers = [
             "server_id", "server_ip", "server_location", "app_id",
-            "app_label", "app_type", "app_url", "files_size", "db_size",
+            "app_label", "app_type", "app_url", "db_name", "files_size", "db_size",
             "is_staging",
         ]
         widths = {h: max(len(h), max(len(r[h]) for r in rows)) for h in headers}
@@ -1754,7 +1765,7 @@ def main():
         writer = csv.DictWriter(f, fieldnames=[
             "server_id", "server_label", "server_ip", "server_location",
             "app_id", "app_label", "app_type", "app_url",
-            "sys_user", "is_staging", "files_size", "db_size",
+            "sys_user", "db_name", "is_staging", "files_size", "db_size",
         ])
         writer.writeheader()
         writer.writerows(rows)
