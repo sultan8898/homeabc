@@ -23,6 +23,7 @@ Env: CW_ACCESS_TOKEN, or CW_EMAIL + CW_API_KEY
 """
 
 from typing import Optional
+import glob
 import os
 import re
 import sys
