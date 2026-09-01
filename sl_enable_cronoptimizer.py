@@ -23,7 +23,6 @@ Env: CW_ACCESS_TOKEN, or CW_EMAIL + CW_API_KEY
 """
 
 from typing import Optional
-import glob
 import os
 import re
 import sys
@@ -166,8 +165,8 @@ def refresh_token(email: str, secret: str, api_base: str) -> str:
 def detect_server_id() -> str:
     """Parse server_id from local cloudwaysapps domains in nginx configs."""
     try:
-        for conf in glob.glob("/home/master/applications/*/conf/server.nginx"):
-            text = Path(conf).read_text(errors="ignore")
+        for conf in Path("/home/master/applications").glob("*/conf/server.nginx"):
+            text = conf.read_text(errors="ignore")
             m = re.search(r"[a-z]+-(\d+)-\d+\.cloudwaysapps\.com", text)
             if m:
                 return m.group(1)
