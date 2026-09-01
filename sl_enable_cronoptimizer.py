@@ -161,43 +161,29 @@ def refresh_token(email: str, secret: str, api_base: str) -> str:
     return token
 
 
-# ── Server ID auto-detect (when run on the target server) ────────────────────
-def detect_server_id() -> str:
-    """Parse server_id from local cloudwaysapps domains in nginx configs."""
-    try:
-        for conf in Path("/home/master/applications").glob("*/conf/server.nginx"):
-            text = conf.read_text(errors="ignore")
-            m = re.search(r"[a-z]+-(\d+)-\d+\.cloudwaysapps\.com", text)
-            if m:
-                return m.group(1)
-    except OSError:
-        pass
-    return ""
+APP_FQDN_RE = re.compile(
+    r"[a-zA-Z0-9_]+-(\d+)-(\d+)\.cloudwaysapps\.com"
+)
+APPS_ROOT = Path("/home/master/applications")
 
 
-# ── App discovery via API ─────────────────────────────────────────────────────
-def get_apps_for_server(server_id: str, token: str, api_base: str) -> list:
-    """Return eligible apps [{app_id, label, application}] for server_id."""
-    servers_path = "servers" if api_base == API_V2 else "server"
-    try:
-        resp = requests.get(
-            f"{api_base}/{servers_path}",
-            headers=auth_headers(token),
-            timeout=60,
-        )
-        resp.raise_for_status()
-        servers = resp.json().get("servers", [])
-    except requests.RequestException as e:
-        print(f"[ERROR] Failed to fetch server list: {e}")
-        sys.exit(1)
+def _parse_servers_payload(payload) -> list:
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    for key in ("servers", "data"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict) and isinstance(value.get("servers"), list):
+            return value["servers"]
+    return []
 
-    target = next((s for s in servers if str(s.get("id")) == str(server_id)), None)
-    if target is None:
-        print(f"[ERROR] Server ID {server_id} not found on this account.")
-        sys.exit(1)
 
+def _list_eligible_apps(server: dict) -> list:
     apps = []
-    for app in target.get("apps", []):
+    for app in server.get("apps", []):
         app_type = str(app.get("application", "")).lower()
         if app_type not in ELIGIBLE_TYPES:
             print(f"  [skip] {app.get('label','?')} (type={app_type})")
@@ -212,6 +198,208 @@ def get_apps_for_server(server_id: str, token: str, api_base: str) -> list:
             "sys_user":    str(app.get("sys_user", "")),
         })
     return apps
+
+
+def _list_eligible_apps_from_records(records: list, server_id: str) -> list:
+    apps = []
+    for app in records:
+        app_server = str(
+            app.get("server_id") or app.get("serverId") or app.get("server", "")
+        )
+        if app_server and app_server != str(server_id):
+            continue
+        app_type = str(app.get("application", "")).lower()
+        if app_type not in ELIGIBLE_TYPES:
+            print(f"  [skip] {app.get('label','?')} (type={app_type})")
+            continue
+        if SKIP_STAGING and str(app.get("is_staging", "0")) == "1":
+            print(f"  [skip] {app.get('label','?')} (staging app)")
+            continue
+        apps.append({
+            "app_id":      str(app.get("id")),
+            "label":       app.get("label", ""),
+            "application": app_type,
+            "sys_user":    str(app.get("sys_user", "")),
+        })
+    return apps
+
+
+def fetch_servers(token: str, api_base: str) -> list:
+    """Collect servers from API list endpoints (with pagination when present)."""
+    servers = []
+    seen_ids = set()
+
+    def add_servers(items):
+        for server in items:
+            sid = str(server.get("id", ""))
+            if sid and sid not in seen_ids:
+                seen_ids.add(sid)
+                servers.append(server)
+
+    list_paths = ["server", "servers"]
+    for path in list_paths:
+        url = f"{api_base}/{path}"
+        while url:
+            try:
+                resp = requests.get(url, headers=auth_headers(token), timeout=60)
+                if resp.status_code >= 400:
+                    break
+                payload = resp.json()
+            except (requests.RequestException, ValueError):
+                break
+
+            add_servers(_parse_servers_payload(payload))
+            url = ""
+            if isinstance(payload, dict):
+                pagination = payload.get("pagination") or {}
+                for key in ("next", "next_page_url", "next_url"):
+                    nxt = pagination.get(key) or payload.get(key)
+                    if nxt:
+                        url = nxt
+                        break
+
+    if not servers and api_base == API_V2:
+        try:
+            resp = requests.get(
+                f"{api_base}/applications",
+                headers=auth_headers(token),
+                timeout=60,
+            )
+            if resp.status_code < 400:
+                apps = _parse_servers_payload(resp.json())
+                if not apps and isinstance(resp.json(), dict):
+                    apps = resp.json().get("applications", [])
+                by_server = {}
+                for app in apps:
+                    sid = str(app.get("server_id") or app.get("serverId") or "")
+                    if sid:
+                        by_server.setdefault(sid, {"id": sid, "apps": []})
+                        by_server[sid]["apps"].append(app)
+                add_servers(by_server.values())
+        except (requests.RequestException, ValueError):
+            pass
+
+    return servers
+
+
+def fetch_server_by_id(server_id: str, token: str, api_base: str) -> Optional[dict]:
+    paths = [f"server/{server_id}", f"servers/{server_id}"]
+    for path in paths:
+        try:
+            resp = requests.get(
+                f"{api_base}/{path}",
+                headers=auth_headers(token),
+                timeout=60,
+            )
+            if resp.status_code >= 400:
+                continue
+            payload = resp.json()
+            if isinstance(payload, dict):
+                for key in ("server", "data"):
+                    if isinstance(payload.get(key), dict):
+                        return payload[key]
+                if str(payload.get("id", "")) == str(server_id):
+                    return payload
+        except (requests.RequestException, ValueError):
+            continue
+    return None
+
+
+def discover_apps_local(server_id: str) -> list:
+    """Discover apps from on-server nginx configs when API listing fails."""
+    if not APPS_ROOT.is_dir():
+        return []
+
+    apps = []
+    for conf in APPS_ROOT.glob("*/conf/server.nginx"):
+        try:
+            text = conf.read_text(errors="ignore")
+        except OSError:
+            continue
+        m = APP_FQDN_RE.search(text)
+        if not m:
+            continue
+        sid, aid = m.group(1), m.group(2)
+        if server_id and sid != str(server_id):
+            continue
+
+        sys_user = conf.parent.parent.name
+        public_html = conf.parent.parent / "public_html"
+        if (public_html / "wp-config.php").exists():
+            app_type = "wordpress"
+        elif (public_html / "wp-config.php").is_symlink():
+            app_type = "wordpress"
+        else:
+            app_type = "wordpressdefault"
+
+        apps.append({
+            "app_id":      aid,
+            "label":       sys_user,
+            "application": app_type,
+            "sys_user":    sys_user,
+        })
+    return apps
+
+
+# ── Server ID auto-detect (when run on the target server) ────────────────────
+def detect_server_id() -> str:
+    """Parse server_id from local cloudwaysapps domains in nginx configs."""
+    try:
+        for conf in APPS_ROOT.glob("*/conf/server.nginx"):
+            text = conf.read_text(errors="ignore")
+            m = APP_FQDN_RE.search(text)
+            if m:
+                return m.group(1)
+    except OSError:
+        pass
+    return ""
+
+
+# ── App discovery via API ─────────────────────────────────────────────────────
+def get_apps_for_server(server_id: str, token: str, api_base: str) -> list:
+    """Return eligible apps [{app_id, label, application}] for server_id."""
+    servers = fetch_servers(token, api_base)
+    target = next((s for s in servers if str(s.get("id")) == str(server_id)), None)
+
+    if target is None:
+        target = fetch_server_by_id(server_id, token, api_base)
+
+    if target is not None:
+        apps = _list_eligible_apps(target)
+        if apps:
+            return apps
+
+    # Scoped tokens may not return server lists; /applications can still work.
+    try:
+        resp = requests.get(
+            f"{api_base}/applications",
+            headers=auth_headers(token),
+            timeout=60,
+        )
+        if resp.status_code < 400:
+            payload = resp.json()
+            records = payload.get("applications", [])
+            if not isinstance(records, list):
+                records = _parse_servers_payload(payload)
+            apps = _list_eligible_apps_from_records(records, server_id)
+            if apps:
+                print("  [note] Apps loaded via /applications (server list unavailable).")
+                return apps
+    except (requests.RequestException, ValueError):
+        pass
+
+    local_apps = discover_apps_local(server_id)
+    if local_apps:
+        print("  [note] Apps discovered from local nginx configs (API server list miss).")
+        return local_apps
+
+    if servers:
+        available = ", ".join(sorted(str(s.get("id")) for s in servers if s.get("id")))
+        print(f"[ERROR] Server ID {server_id} not found. API returned: {available}")
+    else:
+        print(f"[ERROR] Server ID {server_id} not found and API returned no servers.")
+        print("  Check token scope (needs access to this server) or verify the server ID.")
+    sys.exit(1)
 
 
 # ── Resume support ────────────────────────────────────────────────────────────
