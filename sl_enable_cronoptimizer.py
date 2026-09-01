@@ -7,9 +7,8 @@ Auth (pick one):
   directly as Bearer on API v2 (no OAuth exchange).
 - Legacy API key: account email + API key → OAuth access token (v2, then v1).
 
-Cron optimizer endpoints:
-- v2: PUT /api/v2/applications/{app_id}/cron-optimizer  {"enabled": true}
-- v1: POST /api/v1/app/manage/cron_setting (legacy fallback)
+Cron optimizer endpoint (confirmed via szeeshan10/scripts enable_cronoptimizer_server.sh):
+- POST /api/v1|v2/app/manage/cron_setting  (form: server_id, app_id, status=enable)
 
 Flow:
 - App list from GET /server(s); filters application type + is_staging == "0"
@@ -442,48 +441,27 @@ def load_fact_enabled() -> set:
 # ── Enable Cron Optimizer ───────────────────────────────────────────────────────
 def enable_cron_optimizer(app_id: str, server_id: str, token: str, api_base: str):
     """
-    v2: PUT /applications/{app_id}/cron-optimizer
-    v1: POST /app/manage/cron_setting (retries on in-progress conflicts)
-    Returns (operation_id_or_None, error_message).
+    POST /app/manage/cron_setting with status=enable.
+    Tries API v2 then v1 (PUT /applications/.../cron-optimizer returns 405).
+    Returns (operation_id_or_None, error_message, api_base_used).
     """
-    if api_base == API_V2:
-        return _enable_cron_v2(app_id, token)
-    return _enable_cron_v1(app_id, server_id, token, api_base)
+    last_err = ""
+    bases = []
+    for base in (API_V2, API_V1):
+        if base not in bases:
+            bases.append(base)
+    if api_base not in bases:
+        bases.insert(0, api_base)
+
+    for base in bases:
+        op_id, err = _post_cron_setting(app_id, server_id, token, base)
+        if op_id:
+            return op_id, "", base
+        last_err = err
+    return None, last_err, api_base
 
 
-def _enable_cron_v2(app_id: str, token: str):
-    url = f"{API_V2}/applications/{app_id}/cron-optimizer"
-    enabled = CRON_STATUS == "enable"
-    try:
-        resp = requests.put(
-            url,
-            headers={**auth_headers(token), "Content-Type": "application/json"},
-            json={"enabled": enabled},
-            timeout=30,
-        )
-    except requests.RequestException as e:
-        return None, str(e)
-
-    try:
-        body = resp.json() if resp.text else {}
-    except ValueError:
-        body = {"raw": resp.text[:300]}
-
-    if resp.status_code == 403:
-        return None, (
-            f"HTTP 403: {body}. Token may lack FULL ACCESS scope for this app."
-        )
-    if resp.status_code not in (200, 201, 202):
-        return None, f"HTTP {resp.status_code}: {body}"
-
-    op_id = body.get("operation_id")
-    if op_id:
-        return str(op_id), ""
-    # v2 may complete synchronously without an operation_id
-    return "sync", ""
-
-
-def _enable_cron_v1(app_id: str, server_id: str, token: str, api_base: str):
+def _post_cron_setting(app_id: str, server_id: str, token: str, api_base: str):
     url  = f"{api_base}/app/manage/cron_setting"
     data = {"server_id": server_id, "app_id": app_id, "status": CRON_STATUS}
 
@@ -512,6 +490,9 @@ def _enable_cron_v1(app_id: str, server_id: str, token: str, api_base: str):
             time.sleep(INPROG_WAIT)
             continue
 
+        if resp.status_code == 405:
+            return None, f"HTTP 405: {body}"
+
         if resp.status_code != 200:
             return None, f"HTTP {resp.status_code}: {body}"
 
@@ -525,9 +506,6 @@ def _enable_cron_v1(app_id: str, server_id: str, token: str, api_base: str):
 
 # ── Poll operation ────────────────────────────────────────────────────────────
 def wait_for_operation(op_id: str, token: str, api_base: str):
-    if op_id == "sync":
-        return True, "enabled (synchronous)"
-
     url      = f"{api_base}/operation/{op_id}"
     deadline = time.time() + POLL_TIMEOUT
 
@@ -673,7 +651,7 @@ def main():
         token = refresh_token(email, secret, api_base)
 
         print("    -> Enabling Cron Optimizer ...")
-        op_id, err = enable_cron_optimizer(app_id, server_id, token, api_base)
+        op_id, err, cron_api = enable_cron_optimizer(app_id, server_id, token, api_base)
         if not op_id:
             reason = f"Enable request failed: {err}"
             print(f"    x {reason}\n")
@@ -681,9 +659,8 @@ def main():
             failed += 1
             continue
 
-        if op_id != "sync":
-            print(f"    -> Operation ID: {op_id}")
-        ok, msg = wait_for_operation(op_id, token, api_base)
+        print(f"    -> Operation ID: {op_id}")
+        ok, msg = wait_for_operation(op_id, token, cron_api)
         if ok:
             print(f"    OK Done -- {msg}\n")
             log_success(server_id, app)
