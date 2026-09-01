@@ -442,12 +442,12 @@ def load_fact_enabled() -> set:
 def enable_cron_optimizer(app_id: str, server_id: str, token: str, api_base: str):
     """
     POST /app/manage/cron_setting with status=enable.
-    Tries API v2 then v1 (PUT /applications/.../cron-optimizer returns 405).
+    Tries API v1 then v2 (POST only; PUT/PATCH return 405).
     Returns (operation_id_or_None, error_message, api_base_used).
     """
     last_err = ""
     bases = []
-    for base in (API_V2, API_V1):
+    for base in (API_V1, API_V2):
         if base not in bases:
             bases.append(base)
     if api_base not in bases:
