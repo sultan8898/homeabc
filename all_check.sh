@@ -17,6 +17,57 @@
 # breakdowns cover a real window.
 N=${1:-1000}
 
+declare -A IP_HOST_CACHE
+
+# Reverse-DNS an IP to a short display label (e.g. googlebot, amazonaws).
+ip_short_hostname() {
+    local ip="$1" ptr short
+    [[ -n "${IP_HOST_CACHE[$ip]}" ]] && { echo "${IP_HOST_CACHE[$ip]}"; return; }
+
+    ptr=$(dig +short +time=1 +tries=1 -x "$ip" 2>/dev/null | head -1 | sed 's/\.$//')
+    if [[ -z "$ptr" ]] && command -v host >/dev/null 2>&1; then
+        ptr=$(host -W 1 "$ip" 2>/dev/null | awk '/domain name pointer/ {print $NF; exit}' | sed 's/\.$//')
+    fi
+
+    if [[ -z "$ptr" ]]; then
+        IP_HOST_CACHE[$ip]="-"
+        echo "-"
+        return
+    fi
+
+    short=$(echo "$ptr" | grep -oiE 'googlebot|bingbot|applebot|yandex|ahrefsbot|semrushbot|mj12bot|dotbot|petalbot|bytespider|amazonbot|gptbot|claudebot|ccbot|perplexitybot|uptimerobot|pinterestbot|facebookexternalhit|meta-externalagent|amazonaws|cloudflare|fastly|hetzner|digitalocean|ovh|linode|vultr' | head -1 | tr '[:upper:]' '[:lower:]')
+
+    if [[ -z "$short" ]]; then
+        short=$(echo "$ptr" | awk -F. '{label=$(NF-2); if (label ~ /^[a-zA-Z]/) print label; else print $(NF-1)}' | cut -c1-15)
+    fi
+
+    [[ -z "$short" ]] && short="-"
+    IP_HOST_CACHE[$ip]="$short"
+    echo "$short"
+}
+
+# Print php-app.access.log lines with IP, reverse-DNS label, path, and metric.
+print_php_perf_lines() {
+    local mode="$1" count="$2"
+    shift 2
+    local -a sources=("$@")
+    local sort_field=13
+    [[ "$mode" == "cpu" ]] && sort_field=12
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local ip path host
+        ip=$(awk '{print $1}' <<<"$line")
+        path=$(awk '{print $6}' <<<"$line" | tr -d '"')
+        host=$(ip_short_hostname "$ip")
+        if [[ "$mode" == "memory" ]]; then
+            awk -v ip="$ip" -v host="$host" -v path="$path" '{printf "%-39s %-15s %-40s ===> %.2f MB\n", ip, host, path, $13/1024/1024}' <<<"$line"
+        else
+            awk -v ip="$ip" -v host="$host" -v path="$path" '{printf "%-39s %-15s %-40s ===> %s Secs\n", ip, host, path, $12}' <<<"$line"
+        fi
+    done < <(tail "${sources[@]}" 2>/dev/null | tr -d '\000' | sort -k"${sort_field}" -nr | head -n "$count")
+}
+
 echo "=========================================================="
 echo " SERVER SNAPSHOT (right now)"
 echo "=========================================================="
@@ -153,10 +204,10 @@ for A in $(ls -l /home/master/applications/ | grep "^d" | awk '{print $NF}'); do
         # ---------------- PHP WORKER LOGS (Performance) ---------------- #
         if [ -f "$PHP_ACCESS_LOG" ]; then
             echo -e "\n---> Top 5 Memory-Heavy PHP Requests:"
-            tail -n $N "$PHP_ACCESS_LOG" 2>/dev/null | tr -d '\000' | sort -k13 -nr | head -n 5 | awk '{printf "%-15s %-45s ===> %.2f MB\n", $1, $6, $13/1024/1024}' | sed 's/"//g'
+            print_php_perf_lines memory 5 -n "$N" "$PHP_ACCESS_LOG"
 
             echo -e "\n---> Top 5 Slowest PHP Requests (CPU Time):"
-            tail -n $N "$PHP_ACCESS_LOG" 2>/dev/null | tr -d '\000' | sort -k12 -nr | head -n 5 | awk '{printf "%-15s %-45s ===> %s Secs\n", $1, $6, $12}' | sed 's/"//g'
+            print_php_perf_lines cpu 5 -n "$N" "$PHP_ACCESS_LOG"
         fi
 
         if [ -s "$SLOW_LOG" ]; then
@@ -215,10 +266,10 @@ echo "     (Multiple apps firing on the same minute boundary = synchronized cron
 tail -q -n $N /home/master/applications/*/logs/backend_*.cloudwaysapps.com.access.log 2>/dev/null | grep "wp-cron.php" | awk '{print substr($4,2,17)}' | sort | uniq -c | sort -nr | head -n 5
 
 echo -e "\n---> Top 10 Memory-Heavy PHP Requests Across ALL Apps:"
-tail -q -n $N /home/master/applications/*/logs/php-app.access.log 2>/dev/null | tr -d '\000' | sort -k13 -nr | head -n 10 | awk '{printf "%-15s %-45s ===> %.2f MB\n", $1, $6, $13/1024/1024}' | sed 's/"//g'
+print_php_perf_lines memory 10 -q -n "$N" /home/master/applications/*/logs/php-app.access.log
 
 echo -e "\n---> Top 10 Slowest PHP Requests Across ALL Apps (CPU Time):"
-tail -q -n $N /home/master/applications/*/logs/php-app.access.log 2>/dev/null | tr -d '\000' | sort -k12 -nr | head -n 10 | awk '{printf "%-15s %-45s ===> %s Secs\n", $1, $6, $12}' | sed 's/"//g'
+print_php_perf_lines cpu 10 -q -n "$N" /home/master/applications/*/logs/php-app.access.log
 
 # ---------------- MySQL SLOW QUERY LOG ---------------- #
 echo -e "\n---> Top 10 Slowest MySQL Queries (Truncated):"
