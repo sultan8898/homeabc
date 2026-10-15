@@ -26,6 +26,10 @@ Run from cw-proxy / laptop with API (account-wide or other servers):
   curl -fsSL '...' | CW_EMAIL='you@example.com' CW_API_KEY='your-key' python3 - \\
     --mode api --breakdown --apps ffatvrgvnx
 
+Customer report (all servers, website + app + server + bandwidth + size):
+  curl -fsSL 'https://raw.githubusercontent.com/sultan8898/homeabc/cursor/customer-app-report-d6de/list_all_apps.py' \\
+    | CW_ACCESS_TOKEN='cw_...' python3 - --customer-report
+
 Python 3.5+ (cw-proxy).
 """
 
@@ -52,10 +56,10 @@ if sys.version_info < (3, 5):
 API_V2 = "https://api.cloudways.com/api/v2"
 API_V1 = "https://api.cloudways.com/api/v1"
 TOKEN_TTL = 3600
-SCRIPT_BUILD = "app-disk-breakdown-v6"
+SCRIPT_BUILD = "app-disk-breakdown-v7"
 SCRIPT_RAW_URL = (
     "https://raw.githubusercontent.com/sultan8898/homeabc/"
-    "cursor/app-disk-breakdown-c2aa/list_all_apps.py"
+    "cursor/customer-app-report-d6de/list_all_apps.py"
 )
 SCRIPT_CURL_LOCAL = (
     "curl -fsSL '{url}' | python3 - --breakdown --mode local".format(url=SCRIPT_RAW_URL)
@@ -64,8 +68,22 @@ SCRIPT_CURL_API = (
     "curl -fsSL '{url}' | CW_EMAIL='you@example.com' CW_API_KEY='your-key' "
     "python3 - --mode api --breakdown".format(url=SCRIPT_RAW_URL)
 )
+SCRIPT_CURL_CUSTOMER = (
+    "curl -fsSL '{url}' | CW_ACCESS_TOKEN='cw_...' python3 - --customer-report".format(
+        url=SCRIPT_RAW_URL,
+    )
+)
+RATE_SLEEP_BW = 0.35
+APM_TRAFFIC_BIN = "/usr/local/sbin/apm"
+HUMAN_BW_RE = re.compile(
+    r"^([\d.,]+)\s*([KMGT])?(?:i?B)?$", re.IGNORECASE,
+)
 
 _token_cache = {"token": None, "expires_at": None}
+
+
+def is_access_token(value):
+    return str(value).strip().startswith("cw_")
 
 
 def fetch_token(email, api_key):
@@ -191,6 +209,8 @@ def on_cloudways_server():
 
 def can_run_without_api(args, on_cw):
     """On a Cloudways server, breakdown uses live du (API OAuth is often 403)."""
+    if getattr(args, "customer_report", False):
+        return False
     if not on_cw:
         return False
     if args.breakdown or args.totals_only:
@@ -1399,8 +1419,10 @@ def parse_cli_args(argv):
         "  {local}\n\n"
         "Run from anywhere with API (specific apps or account-wide):\n"
         "  {api}\n\n"
+        "Customer report (website, app, server, bandwidth, size):\n"
+        "  {customer}\n\n"
         "Omit --apps on a server to include every app on that machine."
-    ).format(local=SCRIPT_CURL_LOCAL, api=SCRIPT_CURL_API)
+    ).format(local=SCRIPT_CURL_LOCAL, api=SCRIPT_CURL_API, customer=SCRIPT_CURL_CUSTOMER)
     parser = argparse.ArgumentParser(
         description="Cloudways app inventory with optional per-app disk breakdown.",
         epilog=epilog,
@@ -1408,6 +1430,26 @@ def parse_cli_args(argv):
     )
     parser.add_argument("--email", help="Cloudways account email (or CW_EMAIL)")
     parser.add_argument("--api-key", help="Cloudways API key (or CW_API_KEY)")
+    parser.add_argument(
+        "--access-token",
+        help="Cloudways cw_ access token (or CW_ACCESS_TOKEN)",
+    )
+    parser.add_argument(
+        "--customer-report", action="store_true",
+        help="CSV: website, app_name, server_name, bandwidth, size (all servers; uses API)",
+    )
+    parser.add_argument(
+        "--include-staging", action="store_true",
+        help="Include staging apps in --customer-report",
+    )
+    parser.add_argument(
+        "--days", type=int, default=30, metavar="N",
+        help="APM traffic lookback when bandwidth API empty (default: 30)",
+    )
+    parser.add_argument(
+        "--no-local-apm", action="store_true",
+        help="Do not use on-server apm traffic for bandwidth fallback",
+    )
     parser.add_argument(
         "--mode", choices=["api", "local", "cng", "ssh", "skip"],
         help="Size source: local=live du on this server (default with --breakdown here)",
@@ -1451,7 +1493,13 @@ def parse_cli_args(argv):
     return parser.parse_args(argv)
 
 
-def resolve_credentials(args, required=True):
+def load_credentials(args, required=True):
+    token = (
+        (getattr(args, "access_token", None) or "").strip()
+        or os.environ.get("CW_ACCESS_TOKEN", "").strip()
+    )
+    if token:
+        return "", token
     email = (args.email or os.environ.get("CW_EMAIL", "")).strip()
     api_key = (args.api_key or os.environ.get("CW_API_KEY", "")).strip()
     if not email and required:
@@ -1459,11 +1507,24 @@ def resolve_credentials(args, required=True):
     if not api_key and required:
         api_key = getpass.getpass("API key       : ").strip()
     if required and (not email or not api_key):
-        print("[ERROR] Email and API key are required.")
-        print("Set CW_EMAIL and CW_API_KEY, or run on-server with:")
+        print("[ERROR] Set CW_ACCESS_TOKEN or CW_EMAIL + CW_API_KEY.")
+        print("Customer report (all servers):")
+        print("  {}".format(SCRIPT_CURL_CUSTOMER))
+        print("On-server breakdown (no API):")
         print("  {}".format(SCRIPT_CURL_LOCAL))
         sys.exit(1)
     return email, api_key
+
+
+def obtain_api_token(email, secret):
+    if is_access_token(secret):
+        print("  [auth] Using cw_ access token (v2 list + v1 monitor).")
+        return secret
+    return fetch_token(email, secret)
+
+
+def resolve_credentials(args, required=True):
+    return load_credentials(args, required=required)
 
 
 def apply_on_server_defaults(args, on_cw, local_sid):
@@ -1562,6 +1623,415 @@ def run_breakdown_report(token, servers, size_mode, top_n, ssh_user, cng_argv,
     return report
 
 
+def monitor_content_dict(body):
+    if not isinstance(body, dict):
+        return {}
+    for key in ("content", "contents"):
+        val = body.get(key)
+        if isinstance(val, dict):
+            return val
+    mon = body.get("monitor")
+    if isinstance(mon, dict):
+        for key in ("content", "contents"):
+            val = mon.get(key)
+            if isinstance(val, dict):
+                return val
+    return {}
+
+
+def parse_human_bw_to_mb(text):
+    if text is None:
+        return None
+    s = str(text).strip()
+    if not s:
+        return None
+    m = HUMAN_BW_RE.match(s.replace(" ", ""))
+    if not m:
+        return parse_human_size_to_mb(s)
+    val = float(m.group(1).replace(",", ""))
+    unit = (m.group(2) or "M").upper()
+    mult = {"K": 1.0 / 1024.0, "M": 1.0, "G": 1024.0, "T": 1024.0 * 1024.0}
+    return val * mult.get(unit, 1.0)
+
+
+def normalize_monitor_mb(raw):
+    if raw is None:
+        return None
+    v = float(raw)
+    if v > 5e8:
+        return v / (1024.0 * 1024.0)
+    return v
+
+
+def kb_to_mb(kb):
+    if kb is None:
+        return None
+    return float(kb) / 1024.0
+
+
+def format_bandwidth_mb(mb):
+    if mb is None:
+        return "n/a"
+    if mb >= 1024.0:
+        return "{:.2f} GB".format(mb / 1024.0)
+    if mb >= 100:
+        return "{:.0f} MB".format(mb)
+    return "{:.1f} MB".format(mb)
+
+
+def extract_monitor_numeric(datapoint):
+    if datapoint is None:
+        return None
+    if isinstance(datapoint, (int, float)):
+        if _looks_like_timestamp(datapoint):
+            return None
+        return normalize_monitor_mb(float(datapoint))
+    if isinstance(datapoint, str):
+        return parse_human_bw_to_mb(datapoint)
+    if isinstance(datapoint, list):
+        for x in datapoint:
+            n = extract_monitor_numeric(x)
+            if n is not None:
+                return n
+    if isinstance(datapoint, dict):
+        for k in ("value", "usage", "size", "y", "amount"):
+            n = extract_monitor_numeric(datapoint.get(k))
+            if n is not None:
+                return n
+    return None
+
+
+def is_bandwidth_row(item):
+    if not isinstance(item, dict):
+        return False
+    t = str(item.get("type", "")).lower()
+    name = str(item.get("name", "")).lower()
+    if t in ("bw", "bandwidth"):
+        return True
+    return "bandwidth" in name or name == "bw"
+
+
+def bandwidth_value_from_item(item, allow_size=False):
+    for key in ("datapoint", "value", "usage"):
+        raw = extract_monitor_numeric(item.get(key))
+        if raw is not None:
+            return raw
+    if allow_size:
+        raw = extract_monitor_numeric(item.get("size"))
+        if raw is not None:
+            return kb_to_mb(raw)
+    return None
+
+
+def parse_server_monthly_bandwidth_mb(content):
+    for item in content or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).lower()
+        if not is_bandwidth_row(item) and "bandwidth" not in name:
+            continue
+        mb = bandwidth_value_from_item(item)
+        if mb is not None:
+            return mb
+    return None
+
+
+def parse_per_app_bandwidth_rows(content, apps):
+    out = {}
+    for item in content or []:
+        if not isinstance(item, dict):
+            continue
+        if not is_bandwidth_row(item):
+            continue
+        name = str(item.get("name") or item.get("label") or "").strip()
+        if name.lower() in ("bandwidth_monthly", "bandwidth", "bw"):
+            continue
+        su = match_app_sys_user(name, apps)
+        if not su:
+            continue
+        mb = bandwidth_value_from_item(item)
+        if mb is not None:
+            out[su] = mb
+    return out
+
+
+def app_disk_mb_from_bw_summary(body):
+    block = monitor_content_dict(body)
+    if not isinstance(block, dict):
+        return None
+    if not any(k in block for k in ("app_home", "app_mysql", "app_home_size")):
+        return None
+    total = block.get("total")
+    if total is not None:
+        return kb_to_mb(float(total))
+    home = block.get("app_home") or block.get("app_home_size") or 0
+    mysql = block.get("app_mysql") or 0
+    try:
+        return kb_to_mb(float(home) + float(mysql))
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_monitor_graph_mb(body):
+    if not isinstance(body, dict):
+        return None
+    nums = []
+
+    def walk(node):
+        if isinstance(node, list):
+            if len(node) >= 2 and isinstance(node[0], (int, float)) and node[0] > 1e9:
+                n = extract_monitor_numeric(node[1])
+                if n is not None:
+                    nums.append(n)
+                return
+            for el in node:
+                walk(el)
+        elif isinstance(node, dict):
+            for k, v in node.items():
+                if k in ("datapoint", "value", "y", "usage", "total"):
+                    n = extract_monitor_numeric(v)
+                    if n is not None:
+                        nums.append(n)
+                else:
+                    walk(v)
+
+    walk(body.get("contents"))
+    walk(body.get("content"))
+    walk(body.get("data"))
+    return nums[-1] if nums else None
+
+
+def fetch_app_disk_mb_monitor(token, server_id, app):
+    app_id = str(app.get("id", "")).strip()
+    if not app_id:
+        return None
+    for summary_type in ("bandwidth", "bw"):
+        code, body = api_get_v1(
+            token,
+            "/app/monitor/summary",
+            {"server_id": server_id, "app_id": app_id, "type": summary_type},
+        )
+        if code != 200:
+            continue
+        mb = app_disk_mb_from_bw_summary(body)
+        if mb is not None:
+            return mb
+    return None
+
+
+def fetch_app_network_mb(token, server_id, app, debug=False):
+    app_id = str(app.get("id", "")).strip()
+    if not app_id:
+        return None
+    for duration in ("1 Month", "7 Days", "1 Day"):
+        for target in ("bw", "bandwidth", "traffic", "data", "web"):
+            code, body = api_get_v1(
+                token,
+                "/app/monitor/detail",
+                {
+                    "server_id": server_id,
+                    "app_id": app_id,
+                    "target": target,
+                    "duration": duration,
+                    "timezone": "UTC",
+                },
+            )
+            if debug and code != 200:
+                print("    [debug] app {} detail {} {} http={}".format(
+                    app_id, target, duration, code,
+                ))
+            if code != 200:
+                continue
+            mb = parse_monitor_graph_mb(body)
+            if mb is not None:
+                return mb
+            time.sleep(0.08)
+    return None
+
+
+def local_apm_traffic_mb(sys_user, days):
+    apm = APM_TRAFFIC_BIN if os.path.isfile(APM_TRAFFIC_BIN) else apm_binary()
+    if not apm or not sys_user:
+        return None
+    try:
+        proc = subprocess.run(
+            [apm, "traffic", "-s", sys_user, "-l", str(days)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=120,
+            universal_newlines=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    text = proc.stdout or ""
+    best = None
+    for line in text.splitlines():
+        ll = line.lower()
+        if "total" in ll or "transfer" in ll or "bandwidth" in ll or "incoming" in ll:
+            for m in re.finditer(r"([\d.,]+)\s*([KMGT])?i?B", line, re.I):
+                mb = parse_human_bw_to_mb(m.group(0))
+                if mb is not None:
+                    best = mb if best is None else max(best, mb)
+    if best is not None:
+        return best
+    for m in re.finditer(r"([\d.,]+)\s*([KMGT])?i?B", text, re.I):
+        mb = parse_human_bw_to_mb(m.group(0))
+        if mb is not None:
+            best = mb if best is None else max(best, mb)
+    return best
+
+
+def collect_server_bandwidth(token, server_id, apps, days, local_fallback, debug=False):
+    network = {}
+    disk_mb = {}
+    server_monthly_mb = None
+    for summary_type in ("bandwidth", "bw", "disk"):
+        code, body = api_get_v1(
+            token,
+            "/server/monitor/summary",
+            {"server_id": server_id, "type": summary_type},
+        )
+        content = monitor_content_list(body)
+        if debug:
+            print("  [debug] server {} summary type={} http={} rows={}".format(
+                server_id, summary_type, code, len(content or []),
+            ))
+        if code != 200:
+            continue
+        if server_monthly_mb is None:
+            server_monthly_mb = parse_server_monthly_bandwidth_mb(content)
+        per_app = parse_per_app_bandwidth_rows(content, apps)
+        if per_app:
+            network.update(per_app)
+        time.sleep(0.12)
+
+    for app in apps:
+        su = str(app.get("sys_user", "")).strip()
+        if not su:
+            continue
+        dmb = fetch_app_disk_mb_monitor(token, server_id, app)
+        if dmb is not None:
+            disk_mb[su] = dmb
+        if su not in network:
+            mb = fetch_app_network_mb(token, server_id, app, debug=debug)
+            if mb is not None:
+                network[su] = mb
+        time.sleep(RATE_SLEEP_BW)
+
+    if local_fallback and on_cloudways_server():
+        local_sid = detect_local_server_id()
+        if not local_sid or str(local_sid) == str(server_id):
+            for app in apps:
+                su = str(app.get("sys_user", "")).strip()
+                if not su or su in network:
+                    continue
+                mb = local_apm_traffic_mb(su, days)
+                if mb is not None:
+                    network[su] = mb
+
+    return network, disk_mb, server_monthly_mb
+
+
+def format_combined_app_size(files_sz, db_sz, disk_mb_fallback=None):
+    total_mb = 0.0
+    found = False
+    for part in (files_sz, db_sz):
+        mb = parse_human_size_to_mb(part)
+        if mb is not None:
+            total_mb += mb
+            found = True
+    if not found and disk_mb_fallback is not None:
+        total_mb = float(disk_mb_fallback)
+        found = True
+    if not found:
+        if files_sz and files_sz not in ("n/a", "skipped", "unavailable"):
+            return files_sz
+        if db_sz and db_sz not in ("n/a", "skipped", "unavailable"):
+            return db_sz
+        return "n/a"
+    return format_bandwidth_mb(total_mb)
+
+
+def format_customer_bandwidth(app_mb, server_monthly_mb):
+    if app_mb is not None:
+        return format_bandwidth_mb(app_mb)
+    if server_monthly_mb is not None:
+        return "{} (server monthly, shared)".format(format_bandwidth_mb(server_monthly_mb))
+    return "n/a"
+
+
+def run_customer_report(token, servers, args):
+    include_staging = getattr(args, "include_staging", False)
+    days = getattr(args, "days", 30)
+    local_fallback = not getattr(args, "no_local_apm", False)
+    debug = getattr(args, "debug", False)
+
+    if local_fallback and on_cloudways_server():
+        print("  [note] apm traffic fallback enabled for this server (--days {}).".format(days))
+
+    rows = []
+    print("\n[2] Collecting disk sizes (v1 monitor) ...")
+    sizes_by_server = {}
+    for srv in servers:
+        sid = str(srv.get("id", ""))
+        apps = srv.get("apps") or []
+        print("    {} sizes ... ".format(sid), end="")
+        sys.stdout.flush()
+        sizes = collect_sizes_api_for_server(token, sid, apps)
+        sizes_by_server[sid] = sizes if sizes else None
+        print("ok" if sizes else "partial")
+        time.sleep(RATE_SLEEP_BW)
+
+    fill_missing_sizes_via_local_du(servers, sizes_by_server, detect_local_server_id())
+
+    print("\n[3] Collecting bandwidth (network + monitor disk cross-check) ...")
+    for srv in servers:
+        sid = str(srv.get("id", ""))
+        server_label = str(srv.get("label", ""))
+        apps = srv.get("apps") or []
+        if not include_staging:
+            apps = [a for a in apps if str(a.get("is_staging", "0")) != "1"]
+        print("    {} — {} app(s) ...".format(sid, len(apps)), flush=True)
+        bw_map, disk_map, server_monthly = collect_server_bandwidth(
+            token, sid, apps, days, local_fallback, debug=debug,
+        )
+        server_sizes = sizes_by_server.get(sid)
+        for app in apps:
+            su = str(app.get("sys_user", "")).strip()
+            entry = lookup_app_sizes(server_sizes, app) if server_sizes else {}
+            files_sz = entry.get("files_size", "n/a") if isinstance(entry, dict) else "n/a"
+            db_sz = entry.get("db_size", "n/a") if isinstance(entry, dict) else "n/a"
+            rows.append({
+                "website": app_url(app),
+                "app_name": str(app.get("label", "")),
+                "server_name": server_label,
+                "bandwidth": format_customer_bandwidth(bw_map.get(su), server_monthly),
+                "size": format_combined_app_size(
+                    files_sz, db_sz, disk_mb_fallback=disk_map.get(su),
+                ),
+            })
+        time.sleep(RATE_SLEEP_BW)
+
+    print("\n    {} app(s) in customer report.\n".format(len(rows)))
+    headers = ["website", "app_name", "server_name", "bandwidth", "size"]
+    if rows:
+        widths = {h: max(len(h), max(len(str(r[h])) for r in rows)) for h in headers}
+        line = "  ".join(h.ljust(widths[h]) for h in headers)
+        print(line)
+        print("-" * len(line))
+        for r in rows:
+            print("  ".join(str(r[h]).ljust(widths[h]) for h in headers))
+
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    csvpath = os.path.join(os.getcwd(), "cloudways_customer_report_{}.csv".format(stamp))
+    with open(csvpath, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(rows)
+    print("\nCSV written to: {}".format(os.path.abspath(csvpath)))
+    print("=" * 60)
+
+
 def collect_rows(servers, sizes_by_server):
     rows = []
     for srv in servers:
@@ -1634,9 +2104,9 @@ def main():
             print("=" * 60)
         return
 
-    email, api_key = resolve_credentials(args, required=True)
+    email, secret = load_credentials(args, required=True)
     print()
-    token = fetch_token(email, api_key)
+    token = obtain_api_token(email, secret)
     print("\n[1] Fetching server + app list ...")
     servers = fetch_all_servers(token)
     servers = filter_servers_apps(servers, server_id=args.server, app_filters=app_filters)
@@ -1647,6 +2117,10 @@ def main():
         len(servers),
         sum(len(s.get("apps", [])) for s in servers),
     ))
+
+    if args.customer_report:
+        run_customer_report(token, servers, args)
+        return
 
     on_cw = bool(local_sid)
     size_mode = resolve_size_mode(args, on_cw)
