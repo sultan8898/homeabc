@@ -30,9 +30,11 @@ Customer report (all servers, website + app + server + bandwidth + size):
   curl -fsSL 'https://raw.githubusercontent.com/sultan8898/homeabc/cursor/customer-app-report-d6de/list_all_apps.py' \\
     | CW_ACCESS_TOKEN='cw_...' python3 - --customer-report
 
-Single-server app list (app name, db name, URL only — no disk/bandwidth):
-  curl -fsSL 'https://raw.githubusercontent.com/sultan8898/homeabc/cursor/customer-app-report-d6de/list_all_apps.py' \\
-    | CW_ACCESS_TOKEN='cw_...' python3 - --app-list --server 1235009
+App list (app name, db name, URL only — no disk/bandwidth):
+  # one server:
+  curl -fsSL '.../list_all_apps.py' | CW_ACCESS_TOKEN='cw_...' python3 - --app-list --server 1235009
+  # all servers in account (omit --server):
+  curl -fsSL '.../list_all_apps.py' | CW_ACCESS_TOKEN='cw_...' python3 - --app-list
 
 Python 3.5+ (cw-proxy).
 """
@@ -60,7 +62,7 @@ if sys.version_info < (3, 5):
 API_V2 = "https://api.cloudways.com/api/v2"
 API_V1 = "https://api.cloudways.com/api/v1"
 TOKEN_TTL = 3600
-SCRIPT_BUILD = "app-disk-breakdown-v8"
+SCRIPT_BUILD = "app-disk-breakdown-v9"
 SCRIPT_RAW_URL = (
     "https://raw.githubusercontent.com/sultan8898/homeabc/"
     "cursor/customer-app-report-d6de/list_all_apps.py"
@@ -78,6 +80,11 @@ SCRIPT_CURL_CUSTOMER = (
     )
 )
 SCRIPT_CURL_APP_LIST = (
+    "curl -fsSL '{url}' | CW_ACCESS_TOKEN='cw_...' python3 - --app-list".format(
+        url=SCRIPT_RAW_URL,
+    )
+)
+SCRIPT_CURL_APP_LIST_SERVER = (
     "curl -fsSL '{url}' | CW_ACCESS_TOKEN='cw_...' python3 - "
     "--app-list --server SERVER_ID".format(url=SCRIPT_RAW_URL)
 )
@@ -1429,8 +1436,9 @@ def parse_cli_args(argv):
         "  {api}\n\n"
         "Customer report (website, app, server, bandwidth, size):\n"
         "  {customer}\n\n"
-        "Single-server app list (app name, db name, URL only):\n"
-        "  {app_list}\n\n"
+        "App list — all servers (app name, db name, URL only):\n"
+        "  {app_list}\n"
+        "  One server: add --server SERVER_ID\n\n"
         "Omit --apps on a server to include every app on that machine."
     ).format(
         local=SCRIPT_CURL_LOCAL, api=SCRIPT_CURL_API,
@@ -1453,7 +1461,7 @@ def parse_cli_args(argv):
     )
     parser.add_argument(
         "--app-list", action="store_true",
-        help="One server: app_name, db_name, app_url only (requires --server; no disk/bandwidth)",
+        help="app_name, db_name, app_url (optional --server; all servers if omitted; no disk/bandwidth)",
     )
     parser.add_argument(
         "--include-staging", action="store_true",
@@ -2050,9 +2058,10 @@ def run_customer_report(token, servers, args):
 
 
 def run_app_list(servers, args):
-    """App name, MySQL db name, and URL for one server (API metadata only)."""
+    """App name, MySQL db name, and URL (API metadata only; no disk/bandwidth)."""
     include_staging = getattr(args, "include_staging", False)
     as_json = getattr(args, "json", False)
+    multi_server = len(servers) > 1
     rows = []
     for srv in servers:
         server_label = str(srv.get("label", ""))
@@ -2073,8 +2082,11 @@ def run_app_list(servers, args):
         print(json.dumps({"apps": rows}, indent=2))
         return
 
-    headers = ["app_name", "db_name", "app_url"]
-    print("\n    {} app(s) on server.\n".format(len(rows)))
+    if multi_server:
+        headers = ["server_name", "app_name", "db_name", "app_url"]
+    else:
+        headers = ["app_name", "db_name", "app_url"]
+    print("\n    {} app(s) across {} server(s).\n".format(len(rows), len(servers)))
     if rows:
         widths = {h: max(len(h), max(len(str(r[h])) for r in rows)) for h in headers}
         line = "  ".join(h.ljust(widths[h]) for h in headers)
@@ -2084,9 +2096,14 @@ def run_app_list(servers, args):
             print("  ".join(str(r[h]).ljust(widths[h]) for h in headers))
 
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    sid = rows[0]["server_id"] if rows else "server"
+    if multi_server:
+        file_tag = "all"
+    elif rows:
+        file_tag = rows[0]["server_id"]
+    else:
+        file_tag = "empty"
     csvpath = os.path.join(
-        os.getcwd(), "cloudways_app_list_{}_{}.csv".format(sid, stamp),
+        os.getcwd(), "cloudways_app_list_{}_{}.csv".format(file_tag, stamp),
     )
     with open(csvpath, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=headers)
@@ -2168,12 +2185,6 @@ def main():
         if not args.json:
             print("=" * 60)
         return
-
-    if args.app_list and not args.server:
-        print("[ERROR] --app-list requires --server SERVER_ID")
-        print("  Example:")
-        print("  {}".format(SCRIPT_CURL_APP_LIST.replace("SERVER_ID", "1235009")))
-        sys.exit(1)
 
     email, secret = load_credentials(args, required=True)
     print()
