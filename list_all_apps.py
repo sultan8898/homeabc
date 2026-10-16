@@ -30,6 +30,10 @@ Customer report (all servers, website + app + server + bandwidth + size):
   curl -fsSL 'https://raw.githubusercontent.com/sultan8898/homeabc/cursor/customer-app-report-d6de/list_all_apps.py' \\
     | CW_ACCESS_TOKEN='cw_...' python3 - --customer-report
 
+Single-server app list (app name, db name, URL only — no disk/bandwidth):
+  curl -fsSL 'https://raw.githubusercontent.com/sultan8898/homeabc/cursor/customer-app-report-d6de/list_all_apps.py' \\
+    | CW_ACCESS_TOKEN='cw_...' python3 - --app-list --server 1235009
+
 Python 3.5+ (cw-proxy).
 """
 
@@ -56,7 +60,7 @@ if sys.version_info < (3, 5):
 API_V2 = "https://api.cloudways.com/api/v2"
 API_V1 = "https://api.cloudways.com/api/v1"
 TOKEN_TTL = 3600
-SCRIPT_BUILD = "app-disk-breakdown-v7"
+SCRIPT_BUILD = "app-disk-breakdown-v8"
 SCRIPT_RAW_URL = (
     "https://raw.githubusercontent.com/sultan8898/homeabc/"
     "cursor/customer-app-report-d6de/list_all_apps.py"
@@ -72,6 +76,10 @@ SCRIPT_CURL_CUSTOMER = (
     "curl -fsSL '{url}' | CW_ACCESS_TOKEN='cw_...' python3 - --customer-report".format(
         url=SCRIPT_RAW_URL,
     )
+)
+SCRIPT_CURL_APP_LIST = (
+    "curl -fsSL '{url}' | CW_ACCESS_TOKEN='cw_...' python3 - "
+    "--app-list --server SERVER_ID".format(url=SCRIPT_RAW_URL)
 )
 RATE_SLEEP_BW = 0.35
 APM_TRAFFIC_BIN = "/usr/local/sbin/apm"
@@ -209,7 +217,7 @@ def on_cloudways_server():
 
 def can_run_without_api(args, on_cw):
     """On a Cloudways server, breakdown uses live du (API OAuth is often 403)."""
-    if getattr(args, "customer_report", False):
+    if getattr(args, "customer_report", False) or getattr(args, "app_list", False):
         return False
     if not on_cw:
         return False
@@ -1421,8 +1429,13 @@ def parse_cli_args(argv):
         "  {api}\n\n"
         "Customer report (website, app, server, bandwidth, size):\n"
         "  {customer}\n\n"
+        "Single-server app list (app name, db name, URL only):\n"
+        "  {app_list}\n\n"
         "Omit --apps on a server to include every app on that machine."
-    ).format(local=SCRIPT_CURL_LOCAL, api=SCRIPT_CURL_API, customer=SCRIPT_CURL_CUSTOMER)
+    ).format(
+        local=SCRIPT_CURL_LOCAL, api=SCRIPT_CURL_API,
+        customer=SCRIPT_CURL_CUSTOMER, app_list=SCRIPT_CURL_APP_LIST,
+    )
     parser = argparse.ArgumentParser(
         description="Cloudways app inventory with optional per-app disk breakdown.",
         epilog=epilog,
@@ -1439,8 +1452,12 @@ def parse_cli_args(argv):
         help="CSV: website, app_name, server_name, bandwidth, size (all servers; uses API)",
     )
     parser.add_argument(
+        "--app-list", action="store_true",
+        help="One server: app_name, db_name, app_url only (requires --server; no disk/bandwidth)",
+    )
+    parser.add_argument(
         "--include-staging", action="store_true",
-        help="Include staging apps in --customer-report",
+        help="Include staging apps in --customer-report / --app-list",
     )
     parser.add_argument(
         "--days", type=int, default=30, metavar="N",
@@ -2032,6 +2049,54 @@ def run_customer_report(token, servers, args):
     print("=" * 60)
 
 
+def run_app_list(servers, args):
+    """App name, MySQL db name, and URL for one server (API metadata only)."""
+    include_staging = getattr(args, "include_staging", False)
+    as_json = getattr(args, "json", False)
+    rows = []
+    for srv in servers:
+        server_label = str(srv.get("label", ""))
+        server_id = str(srv.get("id", ""))
+        for app in srv.get("apps") or []:
+            if not include_staging and str(app.get("is_staging", "0")) == "1":
+                continue
+            rows.append({
+                "server_id": server_id,
+                "server_name": server_label,
+                "app_name": str(app.get("label", "")),
+                "db_name": app_db_name(app),
+                "app_url": app_url(app),
+                "sys_user": str(app.get("sys_user", "")),
+            })
+
+    if as_json:
+        print(json.dumps({"apps": rows}, indent=2))
+        return
+
+    headers = ["app_name", "db_name", "app_url"]
+    print("\n    {} app(s) on server.\n".format(len(rows)))
+    if rows:
+        widths = {h: max(len(h), max(len(str(r[h])) for r in rows)) for h in headers}
+        line = "  ".join(h.ljust(widths[h]) for h in headers)
+        print(line)
+        print("-" * len(line))
+        for r in rows:
+            print("  ".join(str(r[h]).ljust(widths[h]) for h in headers))
+
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    sid = rows[0]["server_id"] if rows else "server"
+    csvpath = os.path.join(
+        os.getcwd(), "cloudways_app_list_{}_{}.csv".format(sid, stamp),
+    )
+    with open(csvpath, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({h: r[h] for h in headers})
+    print("\nCSV written to: {}".format(os.path.abspath(csvpath)))
+    print("=" * 60)
+
+
 def collect_rows(servers, sizes_by_server):
     rows = []
     for srv in servers:
@@ -2104,6 +2169,12 @@ def main():
             print("=" * 60)
         return
 
+    if args.app_list and not args.server:
+        print("[ERROR] --app-list requires --server SERVER_ID")
+        print("  Example:")
+        print("  {}".format(SCRIPT_CURL_APP_LIST.replace("SERVER_ID", "1235009")))
+        sys.exit(1)
+
     email, secret = load_credentials(args, required=True)
     print()
     token = obtain_api_token(email, secret)
@@ -2120,6 +2191,10 @@ def main():
 
     if args.customer_report:
         run_customer_report(token, servers, args)
+        return
+
+    if args.app_list:
+        run_app_list(servers, args)
         return
 
     on_cw = bool(local_sid)
