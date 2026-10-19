@@ -27,13 +27,17 @@ echo -e "\n=========================================================="
 echo " LOADED VCL (TTL / grace / beresp rules)"
 echo "=========================================================="
 varnishadm vcl.list 2>/dev/null || true
-VCL=$(varnishadm vcl.list 2>/dev/null | awk '/available/ {print $3; exit}')
+# Cloudways lists "active ... boot" — use the boot label (last column), not "available".
+VCL=$(varnishadm vcl.list 2>/dev/null | awk '/^active/ {print $NF; exit}')
 if [ -n "${VCL:-}" ]; then
     echo "Active VCL label: $VCL"
     varnishadm vcl.show "$VCL" 2>/dev/null | grep -nE 'ttl|grace|keep|Cache-Control|max-age|beresp|hash|purge|ban|return \(hit\)|stale' || true
 else
-    echo "Could not detect active VCL name; try: varnishadm vcl.list"
+    echo "Could not detect active VCL name; try: varnishadm vcl.show boot"
 fi
+
+echo -e "\n--- server-ttl override (this usually beats UI \"4 hour\" expectations) ---"
+grep -n 'server-ttl\|beresp.ttl' /etc/varnish/varnish_default_ttl.vcl 2>/dev/null || true
 
 echo -e "\n=========================================================="
 echo " VCL FILES ON DISK"
@@ -59,14 +63,18 @@ echo -e "\n=========================================================="
 echo " LIVE OBJECT TTL (replace HOST and PATH)"
 echo "=========================================================="
 cat <<'EOF'
-# In one terminal, stream Varnish decisions for one URL:
-varnishlog -g request -q 'ReqURL ~ "^/$"' -i ReqURL,ReqHeader,RespHeader,Hit,HitMiss,VCL_call,TTL,Grace,Age,Backend,BackendResp
+# Varnish 6/7: use VSL tag names (Hit/HitMiss/Age are not valid -i tags on all builds).
+# Terminal 1 — then request the URL from outside or curl locally:
+varnishlog -g request -q 'ReqHeader:host ~ "www.fialkov.co.il" && ReqURL ~ "^/$"' \
+  -i ReqURL,ReqHeader,VCL_call,TTL,RespStatus,RespHeader
 
-# Or for a path:
-varnishlog -g request -q 'ReqURL ~ "/jobs/"' -i ReqURL,Hit,HitMiss,TTL,Grace,Age,RespHeader
+# Shorter TTL trace while you generate one request:
+varnishlog -d -i TTL -i BerespTTL -i ReqURL \
+  -q 'ReqHeader:host ~ "fialkov.co.il"'
 
-# One-shot: fetch via localhost with Host header (bypasses Cloudflare):
-curl -sI -H 'Host: www.fialkov.co.il' "http://127.0.0.1/?bust=$(date +%s)" | grep -iE 'age|x-cache|cache-control'
+# Local edge (use www host from server.nginx; http may 301 to https — use -k https or follow -L):
+curl -sIL -k -H 'Host: www.fialkov.co.il' "https://127.0.0.1/?bust=$(date +%s%N)" \
+  | grep -iE 'HTTP|age|x-cache|cache-control|location'
 EOF
 
 echo -e "\n=========================================================="
