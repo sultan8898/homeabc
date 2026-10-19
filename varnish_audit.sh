@@ -63,14 +63,18 @@ echo -e "\n=========================================================="
 echo " LIVE OBJECT TTL (replace HOST and PATH)"
 echo "=========================================================="
 cat <<'EOF'
-# Varnish 6/7: use VSL tag names (Hit/HitMiss/Age are not valid -i tags on all builds).
-# Terminal 1 — then request the URL from outside or curl locally:
-varnishlog -g request -q 'ReqHeader:host ~ "www.fialkov.co.il" && ReqURL ~ "^/$"' \
+# Varnish 6/7 VSL query: use "and" (not &&), ReqHeader:Host (capital H), avoid fragile regex on "/".
+# Terminal 1 — then: curl -sIL -k -H 'Host: www.fialkov.co.il' "https://127.0.0.1/?bust=$(date +%s%N)" -o /dev/null
+varnishlog -g request -q 'ReqHeader:Host ~ "fialkov.co.il" and ReqURL ~ "/"' \
   -i ReqURL,ReqHeader,VCL_call,TTL,RespStatus,RespHeader
 
-# Shorter TTL trace while you generate one request:
-varnishlog -d -i TTL -i BerespTTL -i ReqURL \
-  -q 'ReqHeader:host ~ "fialkov.co.il"'
+# If -q still fails on your build, log TTL for all requests (narrow window):
+varnishlog -d -i TTL -i ReqURL -i RespStatus
+
+# Confirm where 30d is applied:
+grep -rn 'varnish_default_ttl\|server-ttl\|beresp.ttl' /etc/varnish/
+cat /etc/varnish/additional_vcls/resp.vcl
+cat /etc/varnish/backend_response/wordpress.vcl
 
 # Local edge (use www host from server.nginx; http may 301 to https — use -k https or follow -L):
 curl -sIL -k -H 'Host: www.fialkov.co.il' "https://127.0.0.1/?bust=$(date +%s%N)" \
