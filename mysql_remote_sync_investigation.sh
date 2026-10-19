@@ -19,10 +19,26 @@ WINDOW_START="${1:-}"
 WINDOW_END="${2:-}"
 
 MYSQL="${MYSQL:-mysql}"
-ERR_LOG="${ERR_LOG:-/var/log/mysql/error.log}"
-if [[ ! -f "$ERR_LOG" && -f /var/log/mysqld.log ]]; then
-  ERR_LOG="/var/log/mysqld.log"
-fi
+APP_SLUG="${APP_SLUG:-nksfdpuyts}"
+
+resolve_err_log() {
+  local from_mysql
+  from_mysql=$("$MYSQL" -N -e "SHOW VARIABLES LIKE 'log_error';" 2>/dev/null | awk '{print $2}')
+  if [[ -n "$from_mysql" && -f "$from_mysql" ]]; then
+    echo "$from_mysql"
+    return
+  fi
+  for candidate in /var/log/mysql/error.log /var/log/mysqld.log; do
+    if [[ -f "$candidate" ]]; then
+      echo "$candidate"
+      return
+    fi
+  done
+  echo ""
+}
+
+ERR_LOG="${ERR_LOG:-$(resolve_err_log)}"
+SYSLOG="${SYSLOG:-/var/log/syslog}"
 
 section() {
   echo ""
@@ -102,31 +118,84 @@ run_mysql "SHOW GLOBAL STATUS LIKE 'Aborted_%';"
 run_mysql "SHOW GLOBAL STATUS LIKE 'Max_used_connections';"
 run_mysql "SHOW GLOBAL STATUS LIKE 'Threads_%';"
 
-section "5) MariaDB error log (recent + optional window)"
-if [[ -f "$ERR_LOG" ]]; then
-  echo "--- Last 30 lines mentioning client IP, abort, block, handshake, OOM ---"
-  grep -iE "$CLIENT_IP|Aborted connection|Got an error reading|max_user_connections|Host .* is blocked|handshake|SSL|Out of memory|killed" "$ERR_LOG" 2>/dev/null | tail -n 30 || echo "(no matching lines in tail search)"
+echo ""
+echo "--- Pre-auth vs post-auth abort ratio (since last restart) ---"
+echo "If Aborted_connects_preauth ~= Aborted_connects, failures happen during handshake/auth,"
+echo "not idle wait_timeout. Correlate with syslog Access denied / Aborted connection lines."
 
-  if [[ -n "$WINDOW_START" && -n "$WINDOW_END" ]]; then
-    # Normalize ISO timestamps to syslog-style if log uses local time, try both UTC grep on raw ISO substring
-    ISO_DATE="${WINDOW_START:0:10}"
-    echo ""
-    echo "--- Lines on $ISO_DATE near window (manual TZ check; MariaDB often logs local time) ---"
-    grep "$ISO_DATE" "$ERR_LOG" 2>/dev/null | tail -n 200 || true
-  fi
+section "4b) Remote MySQL users (non-localhost)"
+run_mysql "
+SELECT user, host, max_user_connections, max_connections
+FROM mysql.global_priv
+WHERE host NOT IN ('localhost', '127.0.0.1', '::1')
+   OR host LIKE '%.%'
+ORDER BY user, host
+LIMIT 40;" 2>/dev/null || run_mysql "
+SELECT user, host FROM mysql.user
+WHERE host NOT IN ('localhost', '127.0.0.1', '::1')
+ORDER BY user, host LIMIT 40;"
+
+section "5) MariaDB logs (file + syslog/journal — Cloudways often logs to syslog only)"
+run_mysql "SHOW VARIABLES LIKE 'log_error';"
+if [[ -n "$ERR_LOG" && -f "$ERR_LOG" ]]; then
+  echo "Using log_error file: $ERR_LOG"
+  grep -iE "$CLIENT_IP|Aborted connection|Got an error reading|max_user_connections|Host .* is blocked|handshake|SSL|Out of memory|killed" "$ERR_LOG" 2>/dev/null | tail -n 30 || echo "(no matches in file tail grep)"
 else
-  echo "Error log not found at $ERR_LOG"
+  echo "No MariaDB log_error file on disk; using syslog/journal for mariadbd."
 fi
 
-section "6) Firewall / Imunify360 (3306, client IP)"
+mariadb_log_grep() {
+  local pattern=$1
+  local tail_n=${2:-80}
+  if [[ -f "$SYSLOG" ]]; then
+    grep -iE "$pattern" "$SYSLOG" 2>/dev/null | tail -n "$tail_n"
+  fi
+  if command -v journalctl >/dev/null 2>&1; then
+    journalctl -u mariadb --no-pager -n "$tail_n" 2>/dev/null | grep -iE "$pattern" || true
+  fi
+}
+
+echo ""
+echo "--- Recent mariadbd lines for client IP (abort / denied / block / packet) ---"
+mariadb_log_grep "mariadbd.*$CLIENT_IP|mariadbd.*(Aborted connection|Access denied|blocked|handshake|communication packets)" 40
+
+if [[ -n "$WINDOW_START" && -n "$WINDOW_END" ]]; then
+  ISO_DATE="${WINDOW_START:0:10}"
+  HHMM="${WINDOW_START:11:5}"
+  echo ""
+  echo "--- Syslog on $ISO_DATE near ${HHMM} UTC (adjust if server logs local TZ) ---"
+  if [[ -f "$SYSLOG" ]]; then
+    grep "$ISO_DATE" "$SYSLOG" 2>/dev/null | grep -E "mariadbd|$CLIENT_IP|3306" | grep -F "${HHMM}" || \
+      grep "$ISO_DATE" "$SYSLOG" 2>/dev/null | grep -E "mariadbd.*$CLIENT_IP" | tail -n 50
+  fi
+fi
+
+section "6) Firewall / Imunify360 / Remote MySQL (3306, client IP)"
+if [[ -d "/home/master/applications/$APP_SLUG" ]]; then
+  echo "--- Cloudways app: $APP_SLUG (Remote MySQL whitelist is panel-managed; verify IP there) ---"
+fi
+
 if command -v imunify360-agent >/dev/null 2>&1; then
-  echo "--- Imunify360 whitelist grep (client + known NAT IPs) ---"
+  echo "--- Imunify360: white-list / graylist (per-IP; ip-list json is not the full whitelist) ---"
+  check_imunify_ip() {
+    local ip=$1 list_name=$2
+    shift 2
+    if "$@" 2>/dev/null | grep -qF "$ip"; then
+      echo "  $ip found in: $list_name"
+      return 0
+    fi
+    return 1
+  }
   for ip in "$CLIENT_IP" $WHITELIST_EXTRA; do
-    imunify360-agent ip-list list --json 2>/dev/null | grep -F "$ip" && echo "  listed: $ip" || echo "  not found in ip-list json: $ip"
+    found=0
+    check_imunify_ip "$ip" "white-list" imunify360-agent white-list ip list && found=1
+    check_imunify_ip "$ip" "graylist" imunify360-agent graylist ip list && found=1
+    check_imunify_ip "$ip" "ip-list imported" imunify360-agent ip-list imported list && found=1
+    [[ "$found" -eq 0 ]] && echo "  $ip: not in Imunify CLI lists (Remote MySQL / panel whitelist may still apply)"
   done
   echo ""
-  echo "--- Recent Imunify / iptables denials for 3306 or client IP (syslog, last 50) ---"
-  grep -iE "imunify|$CLIENT_IP|3306|REJECT|DROP" /var/log/syslog 2>/dev/null | tail -n 50 || true
+  echo "--- Recent Imunify / iptables denials for 3306 or client IP (syslog, last 80) ---"
+  grep -iE "imunify.*(drop|block|deny)|$CLIENT_IP.*3306|3306.*$CLIENT_IP" "$SYSLOG" 2>/dev/null | tail -n 80 || true
 else
   echo "(imunify360-agent not installed or not in PATH)"
 fi
