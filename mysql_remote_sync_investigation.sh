@@ -163,11 +163,29 @@ if [[ -n "$WINDOW_START" && -n "$WINDOW_END" ]]; then
   ISO_DATE="${WINDOW_START:0:10}"
   HHMM="${WINDOW_START:11:5}"
   echo ""
-  echo "--- Syslog on $ISO_DATE near ${HHMM} UTC (adjust if server logs local TZ) ---"
-  if [[ -f "$SYSLOG" ]]; then
-    grep "$ISO_DATE" "$SYSLOG" 2>/dev/null | grep -E "mariadbd|$CLIENT_IP|3306" | grep -F "${HHMM}" || \
-      grep "$ISO_DATE" "$SYSLOG" 2>/dev/null | grep -E "mariadbd.*$CLIENT_IP" | tail -n 50
-  fi
+  echo "--- Syslog correlation for window (Cloudways: ISO prefix + embedded 'YYYY-MM-DD HH:MM:SS') ---"
+  search_syslog_window() {
+    local file=$1
+    [[ -f "$file" ]] || return
+    echo ">> $file"
+    grep -F "$ISO_DATE" "$file" 2>/dev/null | grep -E "mariadbd|$CLIENT_IP" | grep -E "${HHMM}|T${HHMM}" | head -n 80
+    echo ">> (any $CLIENT_IP on $ISO_DATE near ${HHMM})"
+    grep -F "$ISO_DATE" "$file" 2>/dev/null | grep -F "$CLIENT_IP" | grep -E "${HHMM}|T${HHMM}" | head -n 40
+  }
+  search_syslog_window "$SYSLOG"
+  for rotated in "$SYSLOG".1 "$SYSLOG".2 /var/log/syslog.*.gz; do
+    if [[ -f "$rotated" ]]; then
+      if [[ "$rotated" == *.gz ]]; then
+        echo ">> $rotated (zgrep)"
+        zgrep -F "$ISO_DATE" "$rotated" 2>/dev/null | grep -E "mariadbd|$CLIENT_IP" | grep -E "${HHMM}|T${HHMM}" | head -n 40
+      else
+        search_syslog_window "$rotated"
+      fi
+    fi
+  done
+  echo ""
+  echo "If all empty: MariaDB often logs only rDNS warnings — absence of Aborted connection"
+  echo "does NOT prove the client closed the socket; use pcap from tcpdump during live failure."
 fi
 
 section "6) Firewall / Imunify360 / Remote MySQL (3306, client IP)"
