@@ -49,8 +49,9 @@ try_call() {
   printf '%-6s %-3s  %s\n  -> %s\n' "$http" "$method" "$url" "$msg"
 }
 
-echo "Auth check: GET /server/${SERVER_ID}"
-try_call GET "${API_V2}/server/${SERVER_ID}" json '{}'
+echo "Auth check: GET /servers/${SERVER_ID} (correct v2 single-server route)"
+try_call GET "${API_V2}/servers/${SERVER_ID}" json '{}'
+echo "Note: GET /server/${SERVER_ID} returns plain text, not JSON — do not use it."
 echo
 
 echo "Probing PHP update candidates (target ${TARGET}) ..."

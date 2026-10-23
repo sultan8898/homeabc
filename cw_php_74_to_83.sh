@@ -174,6 +174,8 @@ post_php_version() {
   local server_id="$1" app_id="$2"
   local spec method url mode payload body http_code op_id api_root
   local -a attempts=(
+    "PUT|${API_V2}/servers/${server_id}/applications/${app_id}/php-version|json|{\"php_version\":\"${TARGET_PHP}\"}"
+    "POST|${API_V2}/servers/${server_id}/applications/${app_id}/php-version|json|{\"php_version\":\"${TARGET_PHP}\"}"
     "POST|${API_V2}/app/php-version|json|{\"app_id\":\"${app_id}\",\"server_id\":\"${server_id}\",\"php_version\":\"${TARGET_PHP}\"}"
     "PUT|${API_V2}/php_versions/${app_id}|json|{\"php_version\":\"${TARGET_PHP}\",\"server_id\":\"${server_id}\"}"
     "PUT|${API_V2}/applications/${app_id}/php-version|json|{\"php_version\":\"${TARGET_PHP}\",\"server_id\":\"${server_id}\"}"

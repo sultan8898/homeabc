@@ -216,7 +216,7 @@ def fetch_all_servers(token: str, api_base: str) -> list[dict]:
 
 
 def fetch_server(token: str, api_base: str, server_id: str) -> Optional[dict]:
-    for path in (f"server/{server_id}", f"servers/{server_id}"):
+    for path in (f"servers/{server_id}", f"server/{server_id}"):
         try:
             resp = requests.get(f"{api_base}/{path}", headers=auth_headers(token), timeout=60)
             if resp.status_code >= 400:
