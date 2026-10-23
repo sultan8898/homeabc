@@ -247,6 +247,156 @@ def detect_server_id() -> str:
     return ""
 
 
+def fetch_application_records(token: str, api_base: str) -> list[dict]:
+    """GET /applications (v2) — apps often listed here without nested /server.apps."""
+    records: list[dict] = []
+    for path in ("applications", "apps"):
+        url: Optional[str] = f"{api_base}/{path}"
+        while url:
+            try:
+                resp = requests.get(url, headers=auth_headers(token), timeout=90)
+                if resp.status_code >= 400:
+                    break
+                payload = resp.json()
+            except (requests.RequestException, ValueError):
+                break
+            chunk = []
+            if isinstance(payload, dict):
+                chunk = payload.get("applications") or payload.get("apps") or []
+            if isinstance(chunk, list):
+                records.extend(a for a in chunk if isinstance(a, dict))
+            url = None
+            if isinstance(payload, dict):
+                pag = payload.get("pagination") or {}
+                for key in ("next", "next_page_url", "next_url"):
+                    nxt = pag.get(key) or payload.get(key)
+                    if nxt:
+                        url = str(nxt)
+                        break
+        if records:
+            break
+    return records
+
+
+def local_ids_for_sys_user(sys_user: str) -> tuple[str, str]:
+    """On-server: parse server_id and app_id from cloudwaysapps FQDN in nginx."""
+    conf = APPS_ROOT / sys_user / "conf" / "server.nginx"
+    if not conf.is_file():
+        return "", ""
+    try:
+        m = APP_FQDN_RE.search(conf.read_text(errors="ignore"))
+        if m:
+            return m.group(1), m.group(2)
+    except OSError:
+        pass
+    return "", ""
+
+
+def build_app_rows(
+    token: str,
+    api_base: str,
+    servers: list[dict],
+    *,
+    server_id: str = "",
+    include_staging: bool = False,
+) -> list[dict]:
+    """Merge /applications records with /server payloads and local nginx IDs."""
+    server_labels = {
+        str(s.get("id", "")): s.get("label") or s.get("server_label") or str(s.get("id", ""))
+        for s in servers
+    }
+    nested = iter_apps(
+        servers,
+        server_id=server_id,
+        include_staging=include_staging,
+    )
+    by_key: dict[tuple[str, str], dict] = {}
+    for r in nested:
+        by_key[(r["server_id"], r["app_id"])] = r
+
+    api_apps = fetch_application_records(token, api_base)
+    for app in api_apps:
+        sid = str(app.get("server_id") or app.get("serverId") or app.get("server") or "")
+        aid = str(app.get("id") or app.get("app_id") or "")
+        if not aid:
+            continue
+        if server_id and sid and sid != str(server_id):
+            continue
+        if not include_staging and str(app.get("is_staging", "0")) == "1":
+            continue
+        sys_user = str(app.get("sys_user") or app.get("sysUser") or "")
+        api_php = app_php_from_api(app)
+        local_php = local_php_version(sys_user) if APPS_ROOT.is_dir() else ""
+        if not sid and sys_user:
+            sid, aid_from_nginx = local_ids_for_sys_user(sys_user)
+            if aid_from_nginx and not aid:
+                aid = aid_from_nginx
+        row = {
+            "server_id": sid,
+            "server_label": server_labels.get(sid, sid),
+            "app_id": aid,
+            "label": app.get("label") or app.get("app_label") or sys_user,
+            "application": str(app.get("application", "")),
+            "sys_user": sys_user,
+            "cname": app.get("cname") or app.get("app_fqdn") or "",
+            "php_api": api_php,
+            "php_local": local_php,
+            "php_effective": local_php or api_php,
+        }
+        key = (row["server_id"], row["app_id"])
+        if key in by_key:
+            prev = by_key[key]
+            for field in ("php_api", "php_local", "php_effective", "sys_user", "cname", "label"):
+                if not prev.get(field) and row.get(field):
+                    prev[field] = row[field]
+        else:
+            by_key[key] = row
+
+    if APPS_ROOT.is_dir() and server_id:
+        for conf in APPS_ROOT.glob("*/conf/server.nginx"):
+            sys_user = conf.parent.parent.name
+            sid_l, aid_l = local_ids_for_sys_user(sys_user)
+            if server_id and sid_l and sid_l != str(server_id):
+                continue
+            if not sid_l or not aid_l:
+                continue
+            key = (sid_l, aid_l)
+            if key not in by_key:
+                by_key[key] = {
+                    "server_id": sid_l,
+                    "server_label": server_labels.get(sid_l, sid_l),
+                    "app_id": aid_l,
+                    "label": sys_user,
+                    "application": "",
+                    "sys_user": sys_user,
+                    "cname": "",
+                    "php_api": "",
+                    "php_local": local_php_version(sys_user),
+                    "php_effective": local_php_version(sys_user),
+                }
+
+    return sorted(by_key.values(), key=lambda r: (r["server_id"], r["sys_user"] or r["label"]))
+
+
+def filter_rows(
+    rows: list[dict],
+    *,
+    sys_users: set[str],
+    from_php: str,
+) -> list[dict]:
+    out = rows
+    if sys_users:
+        out = [r for r in out if r.get("sys_user") in sys_users]
+    if from_php:
+        fp = normalize_php_version(from_php)
+        out = [
+            r
+            for r in out
+            if normalize_php_version(r.get("php_effective") or r.get("php_api") or "") == fp
+        ]
+    return out
+
+
 def iter_apps(
     servers: list[dict],
     *,
@@ -427,6 +577,14 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="With --apply, only print planned changes")
     parser.add_argument("--include-staging", action="store_true", help="Include staging apps")
     parser.add_argument("--csv", action="store_true", help="CSV output for --audit")
+    parser.add_argument(
+        "--sys-users",
+        help="Comma-separated sys_user folder names (e.g. anwynsdpyw,csythsnghw)",
+    )
+    parser.add_argument(
+        "--from-php",
+        help="With --apply, only apps on this version (e.g. 7.4). Matches API or local .php_version",
+    )
     args = parser.parse_args()
 
     if not args.audit and not args.apply:
@@ -457,7 +615,18 @@ def main() -> None:
     if not servers:
         sys.exit("[ERROR] No servers returned — check token scope and server id.")
 
-    rows = iter_apps(servers, server_id="" if args.all_servers else server_id, include_staging=args.include_staging)
+    scope_server = "" if args.all_servers else server_id
+    rows = build_app_rows(
+        token,
+        api_base,
+        servers,
+        server_id=scope_server,
+        include_staging=args.include_staging,
+    )
+    sys_user_filter: set[str] = set()
+    if args.sys_users:
+        sys_user_filter = {u.strip() for u in args.sys_users.split(",") if u.strip()}
+    rows = filter_rows(rows, sys_users=sys_user_filter, from_php=args.from_php or "")
     if not rows:
         sys.exit("[ERROR] No applications found for the given scope.")
 
@@ -470,11 +639,13 @@ def main() -> None:
         return
 
     if args.apply:
-        pending = [
-            r
-            for r in rows
-            if normalize_php_version(r["php_effective"]) != target
-        ]
+        pending = [r for r in rows if normalize_php_version(r["php_effective"]) != target]
+        if sys_user_filter or args.from_php:
+            print(
+                f"Filtered scope: {len(rows)} app(s)"
+                + (f", sys_users={len(sys_user_filter)}" if sys_user_filter else "")
+                + (f", from_php={args.from_php}" if args.from_php else "")
+            )
         print(f"Target PHP {target} — {len(pending)} app(s) to update, {len(rows) - len(pending)} already match.")
         ok = fail = 0
         for idx, r in enumerate(pending, 1):
