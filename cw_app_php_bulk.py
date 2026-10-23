@@ -468,18 +468,27 @@ def post_php_version(
 ) -> tuple[Optional[str], str]:
     """Try known Cloudways PHP version endpoints; return (operation_id, error)."""
     form_data = {"server_id": server_id, "app_id": app_id, "php_version": target}
-    attempts: list[tuple[str, str, dict, Any]] = [
-        ("POST", f"{api_base}/app/manage/php_version", {"Content-Type": "application/x-www-form-urlencoded"}, form_data),
-    ]
-    json_body = {"server_id": server_id, "app_id": app_id, "php_version": target}
+    json_min = {"php_version": target}
+    json_srv = {"php_version": target, "server_id": server_id}
+    attempts: list[tuple[str, str, dict, Any]] = []
     if api_base == API_V2:
         attempts.extend(
             [
-                ("POST", f"{api_base}/app/{app_id}/php-version", {"Content-Type": "application/json"}, json_body),
-                ("PUT", f"{api_base}/apps/{app_id}/php-version", {"Content-Type": "application/json"}, {"php_version": f"php{target}"}),
-                ("PUT", f"{api_base}/apps/{app_id}/php-version", {"Content-Type": "application/json"}, {"php_version": target}),
+                ("PUT", f"{api_base}/applications/{app_id}/php-version", {"Content-Type": "application/json"}, json_min),
+                ("PUT", f"{api_base}/applications/{app_id}/php-version?server_id={server_id}", {"Content-Type": "application/json"}, json_min),
+                ("PUT", f"{api_base}/applications/{app_id}/php-version", {"Content-Type": "application/json"}, json_srv),
+                ("PATCH", f"{api_base}/applications/{app_id}/php-version", {"Content-Type": "application/json"}, json_min),
+                ("POST", f"{api_base}/applications/{app_id}/php-version", {"Content-Type": "application/json"}, json_srv),
+                ("PUT", f"{api_base}/apps/{app_id}/php-version", {"Content-Type": "application/json"}, json_srv),
+                ("POST", f"{api_base}/apps/{app_id}/php-version", {"Content-Type": "application/json"}, json_srv),
             ]
         )
+    attempts.extend(
+        [
+            ("POST", f"{API_V2}/app/manage/php_version", {"Content-Type": "application/x-www-form-urlencoded"}, form_data),
+            ("POST", f"{API_V1}/app/manage/php_version", {"Content-Type": "application/x-www-form-urlencoded"}, form_data),
+        ]
+    )
 
     last_err = ""
     for method, url, extra_headers, body in attempts:

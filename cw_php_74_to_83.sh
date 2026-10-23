@@ -17,8 +17,8 @@
 #   POST https://api.cloudways.com/api/v2/oauth/access_token
 #   GET  https://api.cloudways.com/api/v2/applications
 #   GET  https://api.cloudways.com/api/v1/server          (fallback)
-#   POST https://api.cloudways.com/api/v2/app/manage/php_version
-#   POST https://api.cloudways.com/api/v1/app/manage/php_version  (fallback)
+#   PUT  https://api.cloudways.com/api/v2/applications/{app_id}/php-version  (primary)
+#   (+ v2 fallbacks; legacy POST /app/manage/php_version returns 405 on many accounts)
 #   GET  https://api.cloudways.com/api/v2/operation/{operation_id}
 
 set -euo pipefail
@@ -150,29 +150,56 @@ poll_operation() {
   return 1
 }
 
-post_php_version() {
-  local server_id="$1" app_id="$2"
-  local url body op_id http_code api_root
-  for url in "${API_V2}/app/manage/php_version" "${API_V1}/app/manage/php_version"; do
-    api_root="${url%/app/manage/php_version}"
-    body=$(curl -sS --max-time 60 -X POST "$url" \
+http_request() {
+  # $1=METHOD $2=URL $3=content-type (json|form) $4=payload
+  local method="$1" url="$2" mode="$3" payload="$4"
+  if [[ "$mode" == "json" ]]; then
+    curl -sS --max-time 60 -X "$method" "$url" \
+      -H "Authorization: Bearer ${TOKEN}" \
+      -H 'Content-Type: application/json' \
+      -H 'Accept: application/json' \
+      -d "$payload" \
+      -w '\nHTTP:%{http_code}'
+  else
+    curl -sS --max-time 60 -X "$method" "$url" \
       -H "Authorization: Bearer ${TOKEN}" \
       -H 'Content-Type: application/x-www-form-urlencoded' \
-      --data-urlencode "server_id=${server_id}" \
-      --data-urlencode "app_id=${app_id}" \
-      --data-urlencode "php_version=${TARGET_PHP}" \
-      -w '\nHTTP:%{http_code}')
+      -H 'Accept: application/json' \
+      --data "$payload" \
+      -w '\nHTTP:%{http_code}'
+  fi
+}
+
+post_php_version() {
+  local server_id="$1" app_id="$2"
+  local spec method url mode payload body http_code op_id api_root
+  local -a attempts=(
+    "PUT|${API_V2}/applications/${app_id}/php-version|json|{\"php_version\":\"${TARGET_PHP}\"}"
+    "PUT|${API_V2}/applications/${app_id}/php-version?server_id=${server_id}|json|{\"php_version\":\"${TARGET_PHP}\"}"
+    "PUT|${API_V2}/applications/${app_id}/php-version|json|{\"php_version\":\"${TARGET_PHP}\",\"server_id\":\"${server_id}\"}"
+    "PATCH|${API_V2}/applications/${app_id}/php-version|json|{\"php_version\":\"${TARGET_PHP}\"}"
+    "POST|${API_V2}/applications/${app_id}/php-version|json|{\"php_version\":\"${TARGET_PHP}\",\"server_id\":\"${server_id}\"}"
+    "PUT|${API_V2}/apps/${app_id}/php-version|json|{\"php_version\":\"${TARGET_PHP}\",\"server_id\":\"${server_id}\"}"
+    "POST|${API_V2}/apps/${app_id}/php-version|json|{\"php_version\":\"${TARGET_PHP}\",\"server_id\":\"${server_id}\"}"
+    "POST|${API_V2}/app/manage/php_version|form|server_id=${server_id}&app_id=${app_id}&php_version=${TARGET_PHP}"
+    "POST|${API_V1}/app/manage/php_version|form|server_id=${server_id}&app_id=${app_id}&php_version=${TARGET_PHP}"
+  )
+
+  for spec in "${attempts[@]}"; do
+    IFS='|' read -r method url mode payload <<< "$spec"
+    body=$(http_request "$method" "$url" "$mode" "$payload")
     http_code="${body##*HTTP:}"
     body="${body%HTTP:*}"
-    op_id=$(echo "$body" | jq -r '.operation_id // empty' 2>/dev/null || true)
-    if [[ "$http_code" == "200" || "$http_code" == "201" ]]; then
-      echo "    POST $url OK operation_id=${op_id:-n/a}"
+    op_id=$(echo "$body" | jq -r '.operation_id // .operationId // empty' 2>/dev/null || true)
+    if [[ "$http_code" == "200" || "$http_code" == "201" || "$http_code" == "202" ]]; then
+      echo "    ${method} ${url} OK (HTTP ${http_code}) operation_id=${op_id:-n/a}"
       if [[ -n "$op_id" ]]; then
+        if [[ "$url" == "${API_V2}"* ]]; then api_root="$API_V2"; else api_root="$API_V1"; fi
         poll_operation "$op_id" "$api_root" || return 1
       fi
       return 0
     fi
-    echo "    POST $url -> HTTP $http_code $(echo "$body" | head -c 400)" >&2
+    echo "    ${method} ${url} -> HTTP ${http_code} $(echo "$body" | tr '\n' ' ' | head -c 280)" >&2
   done
   return 1
 }
