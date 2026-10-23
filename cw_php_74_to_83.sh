@@ -105,16 +105,32 @@ if [[ -z "$SERVER_ID" ]]; then
   SERVER_ID=$(detect_server_id_local 2>/dev/null || true)
 fi
 
-echo "Fetching application inventory ..."
-APPS_JSON=$(curl -fsS --max-time 120 -H "Authorization: Bearer ${TOKEN}" \
-  -H 'Accept: application/json' "${API_V2}/applications" 2>/dev/null || echo '{}')
+json_apps_count() {
+  echo "$1" | jq -r '.applications | length // 0' 2>/dev/null || echo 0
+}
 
-if [[ "$(echo "$APPS_JSON" | jq '.applications | length // 0')" -eq 0 ]]; then
-  V1_JSON=$(curl -fsS --max-time 120 -H "Authorization: Bearer ${TOKEN}" \
-    -H 'Accept: application/json' "${API_V1}/server" 2>/dev/null || echo '{}')
-  APPS_JSON=$(echo "$V1_JSON" | jq -c '
-    {applications: [ .servers[]? as $s | $s.apps[]? | . + {server_id: ($s.id|tostring)} ]}
-  ' 2>/dev/null || echo '{}')
+echo "Fetching application inventory ..."
+APPS_JSON='{}'
+if RAW=$(curl -sS --max-time 120 -H "Authorization: Bearer ${TOKEN}" \
+  -H 'Accept: application/json' "${API_V2}/applications" 2>/dev/null); then
+  if echo "$RAW" | jq -e . >/dev/null 2>&1; then
+    APPS_JSON="$RAW"
+  else
+    echo "  [note] /applications returned non-JSON; using nginx + .php_version on this server." >&2
+  fi
+fi
+
+if [[ "$(json_apps_count "$APPS_JSON")" -eq 0 ]]; then
+  if V1_JSON=$(curl -sS --max-time 120 -H "Authorization: Bearer ${TOKEN}" \
+    -H 'Accept: application/json' "${API_V1}/server" 2>/dev/null) \
+    && echo "$V1_JSON" | jq -e . >/dev/null 2>&1; then
+    APPS_JSON=$(echo "$V1_JSON" | jq -c '
+      {applications: [ .servers[]? as $s | $s.apps[]? | . + {server_id: ($s.id|tostring)} ]}
+    ' 2>/dev/null || echo '{}')
+  fi
+fi
+if [[ "$(json_apps_count "$APPS_JSON")" -eq 0 ]]; then
+  echo "  [note] API app list empty; resolving server_id/app_id from local nginx configs." >&2
 fi
 
 poll_operation() {
