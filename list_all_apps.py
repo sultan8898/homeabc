@@ -71,7 +71,7 @@ if sys.version_info < (3, 5):
 API_V2 = "https://api.cloudways.com/api/v2"
 API_V1 = "https://api.cloudways.com/api/v1"
 TOKEN_TTL = 3600
-SCRIPT_BUILD = "app-list-php-v3"
+SCRIPT_BUILD = "app-list-php-v4"
 SCRIPT_RAW_URL = (
     "https://raw.githubusercontent.com/sultan8898/homeabc/"
     "cursor/app-list-php-version-43ae/list_all_apps.py"
@@ -1190,8 +1190,9 @@ def resolve_php_fetch_modes(args):
     """
     Ordered remote modes for applications.fact.
 
-    Prefer cng when present; always keep password-ssh available (uses
-    master_user/master_password from GET /server) so customer-box runs work.
+    Prefer cng when present; then password-ssh (master from GET /server).
+    Key-based ssh (root) only when explicitly --mode ssh — otherwise it just
+    noise-fails with Permission denied on Cloudways.
     """
     mode = getattr(args, "mode", None)
     modes = []
@@ -1202,9 +1203,6 @@ def resolve_php_fetch_modes(args):
     else:
         if shutil.which("cng"):
             modes.append("cng")
-        if find_ssh_bin():
-            modes.append("ssh")
-    # Password SSH works without cw-proxy when GET /server returns master_password
     modes.append("pass-ssh")
     return modes
 
@@ -1221,11 +1219,44 @@ def api_get_json(token, url, params=None, timeout=45):
         return None
 
 
+def fetch_server_package_php(token, server_id):
+    """
+    GET /server/manage/settings -> settings.package_versions.php
+
+    Server-wide default PHP (used when apps are on 'server default' / facts
+    unavailable). Not a substitute for per-app versions when they differ.
+    """
+    if not server_id:
+        return ""
+    for base in (API_V2, API_V1):
+        body = api_get_json(
+            token,
+            base + "/server/manage/settings",
+            {"server_id": server_id},
+            timeout=45,
+        )
+        if not isinstance(body, dict):
+            continue
+        settings = body.get("settings") or body
+        if not isinstance(settings, dict):
+            continue
+        packages = settings.get("package_versions") or settings.get("packageVersions") or {}
+        if isinstance(packages, dict) and packages.get("php"):
+            return normalize_php_version(str(packages.get("php")))
+        # Some payloads nest under settings.settings
+        inner = settings.get("settings")
+        if isinstance(inner, dict):
+            packages = inner.get("package_versions") or {}
+            if isinstance(packages, dict) and packages.get("php"):
+                return normalize_php_version(str(packages.get("php")))
+    return ""
+
+
 def collect_php_by_server(token, servers, args):
     """
-    Per-server sys_user -> PHP version from applications.fact.
+    Per-server sys_user -> PHP version.
 
-    Order: local facts -> cng/key-ssh -> password-ssh (master/app from GET /server).
+    Order: local facts -> cng -> password-ssh -> API server package_versions.php.
     """
     local_sid = detect_local_server_id()
     local_map = read_local_app_php_versions() if on_cloudways_server() else {}
@@ -1236,28 +1267,22 @@ def collect_php_by_server(token, servers, args):
     source_ip = detect_source_public_ip(servers, local_sid) if do_whitelist else ""
 
     if "cng" in remote_modes and not shutil.which(cng_argv[0]):
-        print("  [warn] `{}` not found; falling back to ssh/password-ssh.".format(
+        print("  [warn] `{}` not found; falling back to password-ssh / server settings.".format(
             cng_argv[0],
         ))
         remote_modes = [m for m in remote_modes if m != "cng"]
 
     if "ssh" in remote_modes and not find_ssh_bin():
-        print("  [warn] ssh binary not found; password-ssh also unavailable.")
         remote_modes = [m for m in remote_modes if m != "ssh"]
-        # pass-ssh also needs ssh binary
-        if "pass-ssh" in remote_modes and not find_ssh_bin():
-            remote_modes = [m for m in remote_modes if m != "pass-ssh"]
+
+    if "pass-ssh" in remote_modes and not find_ssh_bin():
+        print("  [warn] ssh binary not found; password-ssh unavailable.")
+        remote_modes = [m for m in remote_modes if m != "pass-ssh"]
 
     if do_whitelist:
         print("  [note] --php-whitelist enabled (source IP: {}).".format(
             source_ip or "unknown",
         ))
-
-    if not any(m in remote_modes for m in ("cng", "ssh", "pass-ssh")):
-        print(
-            "  [note] No remote transport for applications.fact "
-            "(need cng or ssh). API has no per-app PHP GET."
-        )
 
     php_by_server = {}
     missing_servers = []
@@ -1314,6 +1339,31 @@ def collect_php_by_server(token, servers, args):
                 if source == "none":
                     source = "api-detail"
 
+        # Server-wide default when apps use package PHP / SSH facts unavailable
+        need_fill = [
+            a for a in apps
+            if str(a.get("sys_user", "") or "").strip()
+            and not php_map.get(str(a.get("sys_user", "")).strip())
+            and (
+                getattr(args, "include_staging", False)
+                or str(a.get("is_staging", "0")) != "1"
+            )
+        ]
+        if need_fill:
+            server_php = fetch_server_package_php(token, sid)
+            if server_php:
+                for app in need_fill:
+                    su = str(app.get("sys_user", "")).strip()
+                    php_map[su] = server_php
+                if source == "none":
+                    source = "server-package"
+                else:
+                    source = "{}+server-package".format(source)
+                print("      [{}] filled {} app(s) from server package PHP {}".format(
+                    sid, len(need_fill), server_php,
+                ))
+            time.sleep(0.2)
+
         php_by_server[sid] = php_map
         expected = 0
         for app in apps:
@@ -1325,14 +1375,15 @@ def collect_php_by_server(token, servers, args):
         print("    {} ({}) PHP via {} — {}/{} app version(s)".format(
             sid or "?", ip or "no-ip", source, len(php_map), expected,
         ))
-        if expected and len(php_map) < expected and not str(source).endswith("facts") and not str(source).startswith("pass-ssh") and source != "local-facts":
+        if expected and len(php_map) < expected:
             missing_servers.append(ip or sid)
 
     if missing_servers:
         print(
             "  [warn] PHP still missing for {} server(s). "
-            "Try --php-whitelist (temp SSH allowlist) or run from cw-proxy "
-            "with --mode cng.".format(len(missing_servers))
+            "Try --php-whitelist or --mode cng from cw-proxy.".format(
+                len(missing_servers),
+            )
         )
     return php_by_server
 
