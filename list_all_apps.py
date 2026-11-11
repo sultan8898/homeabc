@@ -33,10 +33,14 @@ Customer report (all servers, website + app + server + bandwidth + size):
 App list (server IP, app name, PHP version, URL):
   # one server:
   curl -fsSL '.../list_all_apps.py' | CW_ACCESS_TOKEN='cw_...' python3 - --app-list --server 1235009
-  # all servers in account (omit --server):
-  curl -fsSL '.../list_all_apps.py' | CW_ACCESS_TOKEN='cw_...' python3 - --app-list
-  # PHP from /etc/ansible/facts.d/applications.fact via cng (cw-proxy):
+  # all servers — run from cw-proxy so cng can read applications.fact on each box:
   curl -fsSL '.../list_all_apps.py' | CW_ACCESS_TOKEN='cw_...' python3 - --app-list --mode cng
+
+PHP source (per-app):
+  /etc/ansible/facts.d/applications.fact  section [app_php_version]
+  (local, or via cng/ssh). Cloudways API has no documented GET for per-app PHP
+  (only POST /apps/{app_id}/php/version to change it; GET /server/manage/settings
+  returns server package_versions.php, not per-app).
 
 Python 3.5+ (cw-proxy).
 """
@@ -64,7 +68,7 @@ if sys.version_info < (3, 5):
 API_V2 = "https://api.cloudways.com/api/v2"
 API_V1 = "https://api.cloudways.com/api/v1"
 TOKEN_TTL = 3600
-SCRIPT_BUILD = "app-list-php-v1"
+SCRIPT_BUILD = "app-list-php-v2"
 SCRIPT_RAW_URL = (
     "https://raw.githubusercontent.com/sultan8898/homeabc/"
     "cursor/app-list-php-version-43ae/list_all_apps.py"
@@ -83,7 +87,7 @@ SCRIPT_CURL_CUSTOMER = (
     )
 )
 SCRIPT_CURL_APP_LIST = (
-    "curl -fsSL '{url}' | CW_ACCESS_TOKEN='cw_...' python3 - --app-list".format(
+    "curl -fsSL '{url}' | CW_ACCESS_TOKEN='cw_...' python3 - --app-list --mode cng".format(
         url=SCRIPT_RAW_URL,
     )
 )
@@ -938,68 +942,209 @@ def fetch_remote_app_php_versions(mode, server_ip, ssh_user, cng_argv):
     return parse_app_php_from_facts(stdout)
 
 
-def resolve_php_fetch_mode(args):
-    """Prefer explicit --mode cng/ssh; otherwise auto-use cng when available."""
+def resolve_php_fetch_modes(args):
+    """
+    Ordered remote modes for applications.fact.
+
+    Explicit --mode cng|ssh wins. Otherwise try cng (if on PATH), then ssh.
+    GET /server does not include per-app PHP; playground only documents
+    POST /apps/{app_id}/php/version (write) and server package_versions.php.
+    """
     mode = getattr(args, "mode", None)
     if mode in ("cng", "ssh"):
-        return mode
+        return [mode]
+    modes = []
     if shutil.which("cng"):
-        return "cng"
-    return None
+        modes.append("cng")
+    if shutil.which("ssh"):
+        modes.append("ssh")
+    return modes
 
 
-def collect_php_by_server(servers, args):
+def api_get_json(token, url, params=None, timeout=45):
+    try:
+        resp = requests.get(
+            url, headers=auth_headers(token), params=params or {}, timeout=timeout,
+        )
+        if resp.status_code >= 400:
+            return None
+        return resp.json()
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def merge_php_into_apps(servers, php_by_app_id):
+    """Copy php_version onto nested app dicts when API detail endpoints provide it."""
+    if not php_by_app_id:
+        return
+    for srv in servers:
+        for app in srv.get("apps") or []:
+            if not isinstance(app, dict):
+                continue
+            if app_php_from_api(app):
+                continue
+            aid = str(app.get("id", "") or "").strip()
+            if aid and php_by_app_id.get(aid):
+                app["php_version"] = php_by_app_id[aid]
+
+
+def enrich_php_from_api_details(token, servers):
+    """
+    Best-effort: some v2 detail routes occasionally expose php_version.
+    Documented playground has no dedicated per-app PHP GET — this is optional.
+    """
+    php_by_app_id = {}
+
+    # Paginated flexible apps / applications lists
+    for path in ("/apps/flexible", "/applications", "/apps"):
+        url = API_V2 + path
+        pages = 0
+        while url and pages < 20:
+            pages += 1
+            body = api_get_json(token, url)
+            if body is None:
+                break
+            chunk = []
+            if isinstance(body, dict):
+                chunk = (
+                    body.get("applications")
+                    or body.get("apps")
+                    or body.get("data")
+                    or []
+                )
+            elif isinstance(body, list):
+                chunk = body
+            if not isinstance(chunk, list):
+                chunk = []
+            for app in chunk:
+                if not isinstance(app, dict):
+                    continue
+                aid = str(app.get("id") or app.get("app_id") or "").strip()
+                php = app_php_from_api(app)
+                if aid and php:
+                    php_by_app_id[aid] = php
+            nxt = None
+            if isinstance(body, dict):
+                pag = body.get("pagination") or {}
+                for key in ("next", "next_page_url", "next_url"):
+                    cand = pag.get(key) or body.get(key)
+                    if cand:
+                        nxt = str(cand)
+                        break
+            url = nxt
+        if php_by_app_id:
+            break
+
+    # Per-server v2 detail (GET /servers/{id} — not GET /server/{id})
+    for srv in servers:
+        sid = str(srv.get("id", "")).strip()
+        if not sid:
+            continue
+        body = api_get_json(token, API_V2 + "/servers/" + sid)
+        if not isinstance(body, dict):
+            continue
+        detail = body.get("server") or body.get("data") or body
+        if not isinstance(detail, dict):
+            continue
+        for app in detail.get("apps") or []:
+            if not isinstance(app, dict):
+                continue
+            aid = str(app.get("id", "") or "").strip()
+            php = app_php_from_api(app)
+            if aid and php:
+                php_by_app_id[aid] = php
+        time.sleep(0.15)
+
+    merge_php_into_apps(servers, php_by_app_id)
+    return php_by_app_id
+
+
+def collect_php_by_server(token, servers, args):
     """
     Per-server sys_user -> PHP version.
 
     Prefer /etc/ansible/facts.d/applications.fact [app_php_version]
-    (local or via cng/ssh), then fall back to API app.php_version.
+    (local or via cng/ssh). API list endpoints usually omit per-app PHP;
+    detail enrichment is best-effort only.
     """
     local_sid = detect_local_server_id()
     local_map = read_local_app_php_versions() if on_cloudways_server() else {}
-    remote_mode = resolve_php_fetch_mode(args)
+    remote_modes = resolve_php_fetch_modes(args)
     ssh_user = os.environ.get("SSH_USER", "").strip() or "root"
-    cng_argv = ["cng"]
-    if remote_mode == "cng":
-        cng_prefix = os.environ.get("CNG_CMD", "").strip() or "cng"
-        cng_argv = shlex.split(cng_prefix)
+    cng_argv = shlex.split(os.environ.get("CNG_CMD", "").strip() or "cng")
 
-    if remote_mode == "cng" and not shutil.which(cng_argv[0]):
-        print("  [warn] `{}` not found; PHP will use API / local facts only.".format(
-            cng_argv[0],
-        ))
-        remote_mode = None
+    if "cng" in remote_modes and not shutil.which(cng_argv[0]):
+        print("  [warn] `{}` not found; skipping cng for PHP facts.".format(cng_argv[0]))
+        remote_modes = [m for m in remote_modes if m != "cng"]
+
+    if not remote_modes:
+        print(
+            "  [note] No cng/ssh for remote applications.fact. "
+            "Cloudways API has no per-app PHP GET in the playground "
+            "(POST /apps/{{id}}/php/version is write-only; "
+            "GET /server/manage/settings is server package PHP only)."
+        )
+        print("  [note] From cw-proxy, re-run:")
+        print("         {}".format(SCRIPT_CURL_APP_LIST))
+
+    print("  [api] Checking v2 detail endpoints for php_version (usually empty) ...")
+    api_hits = enrich_php_from_api_details(token, servers)
+    if api_hits:
+        print("  [api] Found php_version on {} app detail record(s).".format(len(api_hits)))
+    else:
+        print("  [api] No per-app php_version in API detail responses.")
 
     php_by_server = {}
+    missing_servers = []
     for srv in servers:
         sid = str(srv.get("id", ""))
         ip = str(srv.get("public_ip", "") or srv.get("ip", "") or "").strip()
+        apps = [a for a in (srv.get("apps") or []) if isinstance(a, dict)]
         php_map = {}
-        source = "api"
+        source = "none"
 
         if local_sid and sid == str(local_sid) and local_map:
             php_map = dict(local_map)
             source = "local-facts"
-        elif remote_mode and ip:
-            remote_map = fetch_remote_app_php_versions(
-                remote_mode, ip, ssh_user, cng_argv,
-            )
-            if remote_map:
-                php_map = remote_map
-                source = "{}-facts".format(remote_mode)
+        elif ip:
+            for mode in remote_modes:
+                remote_map = fetch_remote_app_php_versions(
+                    mode, ip, ssh_user, cng_argv,
+                )
+                if remote_map:
+                    php_map = remote_map
+                    source = "{}-facts".format(mode)
+                    break
 
-        for app in srv.get("apps") or []:
+        for app in apps:
             su = str(app.get("sys_user", "") or "").strip()
             if not su or php_map.get(su):
                 continue
             api_php = app_php_from_api(app)
             if api_php:
                 php_map[su] = api_php
+                if source == "none":
+                    source = "api-detail"
 
         php_by_server[sid] = php_map
-        print("    {} ({}) PHP via {} — {} app version(s)".format(
-            sid or "?", ip or "no-ip", source, len(php_map),
+        expected = 0
+        for app in apps:
+            if str(app.get("is_staging", "0")) == "1" and not getattr(
+                args, "include_staging", False,
+            ):
+                continue
+            expected += 1
+        print("    {} ({}) PHP via {} — {}/{} app version(s)".format(
+            sid or "?", ip or "no-ip", source, len(php_map), expected,
         ))
+        if expected and len(php_map) < expected and source in ("none", "api-detail"):
+            missing_servers.append(ip or sid)
+
+    if missing_servers:
+        print(
+            "  [warn] PHP still missing for {} server(s). "
+            "Re-run from cw-proxy: --app-list --mode cng".format(len(missing_servers))
+        )
     return php_by_server
 
 
@@ -1592,8 +1737,8 @@ def parse_cli_args(argv):
     parser.add_argument(
         "--app-list", action="store_true",
         help="CSV: server_ip, app_name, php_version, app_url "
-             "(PHP from applications.fact via local/cng/ssh, else API; "
-             "optional --server; all servers if omitted)",
+             "(PHP from applications.fact via local/cng/ssh — use --mode cng "
+             "from cw-proxy; API has no per-app PHP GET)",
     )
     parser.add_argument(
         "--include-staging", action="store_true",
@@ -2189,12 +2334,12 @@ def run_customer_report(token, servers, args):
     print("=" * 60)
 
 
-def run_app_list(servers, args):
+def run_app_list(token, servers, args):
     """Server IP, app name, PHP version, URL (PHP from applications.fact when possible)."""
     include_staging = getattr(args, "include_staging", False)
     as_json = getattr(args, "json", False)
     print("\n[2] Resolving per-app PHP versions ...")
-    php_by_server = collect_php_by_server(servers, args)
+    php_by_server = collect_php_by_server(token, servers, args)
     rows = []
     for srv in servers:
         server_label = str(srv.get("label", ""))
@@ -2342,7 +2487,7 @@ def main():
         return
 
     if args.app_list:
-        run_app_list(servers, args)
+        run_app_list(token, servers, args)
         return
 
     on_cw = bool(local_sid)
