@@ -30,11 +30,13 @@ Customer report (all servers, website + app + server + bandwidth + size):
   curl -fsSL 'https://raw.githubusercontent.com/sultan8898/homeabc/cursor/customer-app-report-d6de/list_all_apps.py' \\
     | CW_ACCESS_TOKEN='cw_...' python3 - --customer-report
 
-App list (app name, db name, URL only — no disk/bandwidth):
+App list (server IP, app name, PHP version, URL):
   # one server:
   curl -fsSL '.../list_all_apps.py' | CW_ACCESS_TOKEN='cw_...' python3 - --app-list --server 1235009
   # all servers in account (omit --server):
   curl -fsSL '.../list_all_apps.py' | CW_ACCESS_TOKEN='cw_...' python3 - --app-list
+  # PHP from /etc/ansible/facts.d/applications.fact via cng (cw-proxy):
+  curl -fsSL '.../list_all_apps.py' | CW_ACCESS_TOKEN='cw_...' python3 - --app-list --mode cng
 
 Python 3.5+ (cw-proxy).
 """
@@ -62,11 +64,12 @@ if sys.version_info < (3, 5):
 API_V2 = "https://api.cloudways.com/api/v2"
 API_V1 = "https://api.cloudways.com/api/v1"
 TOKEN_TTL = 3600
-SCRIPT_BUILD = "app-disk-breakdown-v9"
+SCRIPT_BUILD = "app-list-php-v1"
 SCRIPT_RAW_URL = (
     "https://raw.githubusercontent.com/sultan8898/homeabc/"
-    "cursor/customer-app-report-d6de/list_all_apps.py"
+    "cursor/app-list-php-version-43ae/list_all_apps.py"
 )
+APPLICATIONS_FACT = "/etc/ansible/facts.d/applications.fact"
 SCRIPT_CURL_LOCAL = (
     "curl -fsSL '{url}' | python3 - --breakdown --mode local".format(url=SCRIPT_RAW_URL)
 )
@@ -874,6 +877,132 @@ def app_url(app):
     return str(app.get("app_fqdn", "") or app.get("url", "") or "").strip()
 
 
+def normalize_php_version(raw):
+    if not raw:
+        return ""
+    s = str(raw).strip().lower()
+    if s.startswith("php"):
+        s = s[3:].lstrip()
+    m = re.search(r"(\d+\.\d+)", s)
+    return m.group(1) if m else s
+
+
+def parse_app_php_from_facts(text):
+    """Parse [app_php_version] from applications.fact -> {sys_user: '7.4'}."""
+    versions = {}
+    if not text:
+        return versions
+    in_section = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            in_section = line[1:-1].strip().lower() == "app_php_version"
+            continue
+        if not in_section or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        sys_user = key.strip()
+        php = normalize_php_version(val)
+        if sys_user and php:
+            versions[sys_user] = php
+    return versions
+
+
+def read_local_app_php_versions(path=None):
+    fact_path = path or APPLICATIONS_FACT
+    try:
+        with open(fact_path, "r", errors="ignore") as fh:
+            return parse_app_php_from_facts(fh.read())
+    except OSError:
+        return {}
+
+
+def app_php_from_api(app):
+    for key in ("php_version", "phpVersion", "php"):
+        if app.get(key):
+            return normalize_php_version(str(app.get(key)))
+    return ""
+
+
+def fetch_remote_app_php_versions(mode, server_ip, ssh_user, cng_argv):
+    """Cat applications.fact on a remote Cloudways server via cng or ssh."""
+    if not server_ip:
+        return {}
+    script = "cat {path} 2>/dev/null || true".format(path=shlex.quote(APPLICATIONS_FACT))
+    stdout, ok, detail = run_remote_script(mode, server_ip, script, ssh_user, cng_argv)
+    if not ok:
+        print("  [warn] {} facts on {} failed: {}".format(mode, server_ip, detail[:200]))
+        return {}
+    return parse_app_php_from_facts(stdout)
+
+
+def resolve_php_fetch_mode(args):
+    """Prefer explicit --mode cng/ssh; otherwise auto-use cng when available."""
+    mode = getattr(args, "mode", None)
+    if mode in ("cng", "ssh"):
+        return mode
+    if shutil.which("cng"):
+        return "cng"
+    return None
+
+
+def collect_php_by_server(servers, args):
+    """
+    Per-server sys_user -> PHP version.
+
+    Prefer /etc/ansible/facts.d/applications.fact [app_php_version]
+    (local or via cng/ssh), then fall back to API app.php_version.
+    """
+    local_sid = detect_local_server_id()
+    local_map = read_local_app_php_versions() if on_cloudways_server() else {}
+    remote_mode = resolve_php_fetch_mode(args)
+    ssh_user = os.environ.get("SSH_USER", "").strip() or "root"
+    cng_argv = ["cng"]
+    if remote_mode == "cng":
+        cng_prefix = os.environ.get("CNG_CMD", "").strip() or "cng"
+        cng_argv = shlex.split(cng_prefix)
+
+    if remote_mode == "cng" and not shutil.which(cng_argv[0]):
+        print("  [warn] `{}` not found; PHP will use API / local facts only.".format(
+            cng_argv[0],
+        ))
+        remote_mode = None
+
+    php_by_server = {}
+    for srv in servers:
+        sid = str(srv.get("id", ""))
+        ip = str(srv.get("public_ip", "") or srv.get("ip", "") or "").strip()
+        php_map = {}
+        source = "api"
+
+        if local_sid and sid == str(local_sid) and local_map:
+            php_map = dict(local_map)
+            source = "local-facts"
+        elif remote_mode and ip:
+            remote_map = fetch_remote_app_php_versions(
+                remote_mode, ip, ssh_user, cng_argv,
+            )
+            if remote_map:
+                php_map = remote_map
+                source = "{}-facts".format(remote_mode)
+
+        for app in srv.get("apps") or []:
+            su = str(app.get("sys_user", "") or "").strip()
+            if not su or php_map.get(su):
+                continue
+            api_php = app_php_from_api(app)
+            if api_php:
+                php_map[su] = api_php
+
+        php_by_server[sid] = php_map
+        print("    {} ({}) PHP via {} — {} app version(s)".format(
+            sid or "?", ip or "no-ip", source, len(php_map),
+        ))
+    return php_by_server
+
+
 def app_db_name(app):
     """MySQL database name for the app (Cloudways API: mysql_db_name)."""
     sys_user = str(app.get("sys_user", "")).strip()
@@ -1436,9 +1565,10 @@ def parse_cli_args(argv):
         "  {api}\n\n"
         "Customer report (website, app, server, bandwidth, size):\n"
         "  {customer}\n\n"
-        "App list — all servers (app name, db name, URL only):\n"
+        "App list — all servers (server IP, app name, PHP, URL):\n"
         "  {app_list}\n"
-        "  One server: add --server SERVER_ID\n\n"
+        "  One server: add --server SERVER_ID\n"
+        "  PHP from applications.fact via cng: add --mode cng\n\n"
         "Omit --apps on a server to include every app on that machine."
     ).format(
         local=SCRIPT_CURL_LOCAL, api=SCRIPT_CURL_API,
@@ -1461,7 +1591,9 @@ def parse_cli_args(argv):
     )
     parser.add_argument(
         "--app-list", action="store_true",
-        help="app_name, db_name, app_url (optional --server; all servers if omitted; no disk/bandwidth)",
+        help="CSV: server_ip, app_name, php_version, app_url "
+             "(PHP from applications.fact via local/cng/ssh, else API; "
+             "optional --server; all servers if omitted)",
     )
     parser.add_argument(
         "--include-staging", action="store_true",
@@ -2058,45 +2190,50 @@ def run_customer_report(token, servers, args):
 
 
 def run_app_list(servers, args):
-    """App name, MySQL db name, and URL (API metadata only; no disk/bandwidth)."""
+    """Server IP, app name, PHP version, URL (PHP from applications.fact when possible)."""
     include_staging = getattr(args, "include_staging", False)
     as_json = getattr(args, "json", False)
-    multi_server = len(servers) > 1
+    print("\n[2] Resolving per-app PHP versions ...")
+    php_by_server = collect_php_by_server(servers, args)
     rows = []
     for srv in servers:
         server_label = str(srv.get("label", ""))
         server_id = str(srv.get("id", ""))
+        server_ip = str(srv.get("public_ip", "") or srv.get("ip", "") or "").strip()
+        php_map = php_by_server.get(server_id) or {}
         for app in srv.get("apps") or []:
             if not include_staging and str(app.get("is_staging", "0")) == "1":
                 continue
+            sys_user = str(app.get("sys_user", "") or "").strip()
+            php = php_map.get(sys_user) or app_php_from_api(app) or ""
             rows.append({
                 "server_id": server_id,
                 "server_name": server_label,
-                "app_name": str(app.get("label", "")),
+                "server_ip": server_ip,
+                "app_name": str(app.get("label", "") or sys_user),
+                "php_version": php,
                 "db_name": app_db_name(app),
                 "app_url": app_url(app),
-                "sys_user": str(app.get("sys_user", "")),
+                "sys_user": sys_user,
             })
 
     if as_json:
         print(json.dumps({"apps": rows}, indent=2))
         return
 
-    if multi_server:
-        headers = ["server_name", "app_name", "db_name", "app_url"]
-    else:
-        headers = ["app_name", "db_name", "app_url"]
+    # Primary columns requested: server IP, app name, PHP version (+ URL).
+    headers = ["server_ip", "app_name", "php_version", "app_url"]
     print("\n    {} app(s) across {} server(s).\n".format(len(rows), len(servers)))
     if rows:
-        widths = {h: max(len(h), max(len(str(r[h])) for r in rows)) for h in headers}
+        widths = {h: max(len(h), max(len(str(r.get(h, ""))) for r in rows)) for h in headers}
         line = "  ".join(h.ljust(widths[h]) for h in headers)
         print(line)
         print("-" * len(line))
         for r in rows:
-            print("  ".join(str(r[h]).ljust(widths[h]) for h in headers))
+            print("  ".join(str(r.get(h, "")).ljust(widths[h]) for h in headers))
 
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    if multi_server:
+    if len(servers) > 1:
         file_tag = "all"
     elif rows:
         file_tag = rows[0]["server_id"]
@@ -2109,7 +2246,7 @@ def run_app_list(servers, args):
         writer = csv.DictWriter(f, fieldnames=headers)
         writer.writeheader()
         for r in rows:
-            writer.writerow({h: r[h] for h in headers})
+            writer.writerow({h: r.get(h, "") for h in headers})
     print("\nCSV written to: {}".format(os.path.abspath(csvpath)))
     print("=" * 60)
 
