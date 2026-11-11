@@ -71,7 +71,7 @@ if sys.version_info < (3, 5):
 API_V2 = "https://api.cloudways.com/api/v2"
 API_V1 = "https://api.cloudways.com/api/v1"
 TOKEN_TTL = 3600
-SCRIPT_BUILD = "app-list-php-v4"
+SCRIPT_BUILD = "app-list-php-v5"
 SCRIPT_RAW_URL = (
     "https://raw.githubusercontent.com/sultan8898/homeabc/"
     "cursor/app-list-php-version-43ae/list_all_apps.py"
@@ -1976,7 +1976,7 @@ def parse_cli_args(argv):
     )
     parser.add_argument(
         "--app-list", action="store_true",
-        help="CSV: server_ip, app_name, php_version, app_url "
+        help="CSV: server_ip, server_name, app_name, php_version, app_url "
              "(PHP from applications.fact via local/cng/ssh/password-ssh; "
              "API has no per-app PHP GET)",
     )
@@ -2611,8 +2611,8 @@ def run_app_list(token, servers, args):
         print(json.dumps({"apps": rows}, indent=2))
         return
 
-    # Primary columns requested: server IP, app name, PHP version (+ URL).
-    headers = ["server_ip", "app_name", "php_version", "app_url"]
+    # Primary columns: server IP/name, app name, PHP version, URL.
+    headers = ["server_ip", "server_name", "app_name", "php_version", "app_url"]
     print("\n    {} app(s) across {} server(s).\n".format(len(rows), len(servers)))
     if rows:
         widths = {h: max(len(h), max(len(str(r.get(h, ""))) for r in rows)) for h in headers}
