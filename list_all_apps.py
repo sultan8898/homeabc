@@ -31,16 +31,18 @@ Customer report (all servers, website + app + server + bandwidth + size):
     | CW_ACCESS_TOKEN='cw_...' python3 - --customer-report
 
 App list (server IP, app name, PHP version, URL):
-  # one server:
-  curl -fsSL '.../list_all_apps.py' | CW_ACCESS_TOKEN='cw_...' python3 - --app-list --server 1235009
-  # all servers — run from cw-proxy so cng can read applications.fact on each box:
+  # From any host with CW_ACCESS_TOKEN (customer server OK — uses master SSH):
+  curl -fsSL '.../list_all_apps.py' | CW_ACCESS_TOKEN='cw_...' python3 - --app-list
+  # Prefer cng when on cw-proxy:
   curl -fsSL '.../list_all_apps.py' | CW_ACCESS_TOKEN='cw_...' python3 - --app-list --mode cng
+  # If SSH whitelist blocks server-to-server, allow temporary allowlist:
+  curl -fsSL '.../list_all_apps.py' | CW_ACCESS_TOKEN='cw_...' python3 - --app-list --php-whitelist
 
 PHP source (per-app):
   /etc/ansible/facts.d/applications.fact  section [app_php_version]
-  (local, or via cng/ssh). Cloudways API has no documented GET for per-app PHP
-  (only POST /apps/{app_id}/php/version to change it; GET /server/manage/settings
-  returns server package_versions.php, not per-app).
+  via local file, cng, key-ssh, or password-ssh using master_user/master_password
+  from GET /server. Cloudways API has no documented per-app PHP GET
+  (POST /apps/{app_id}/php/version is write-only).
 
 Python 3.5+ (cw-proxy).
 """
@@ -53,6 +55,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 import getpass
 import shutil
@@ -68,7 +71,7 @@ if sys.version_info < (3, 5):
 API_V2 = "https://api.cloudways.com/api/v2"
 API_V1 = "https://api.cloudways.com/api/v1"
 TOKEN_TTL = 3600
-SCRIPT_BUILD = "app-list-php-v2"
+SCRIPT_BUILD = "app-list-php-v3"
 SCRIPT_RAW_URL = (
     "https://raw.githubusercontent.com/sultan8898/homeabc/"
     "cursor/app-list-php-version-43ae/list_all_apps.py"
@@ -87,7 +90,7 @@ SCRIPT_CURL_CUSTOMER = (
     )
 )
 SCRIPT_CURL_APP_LIST = (
-    "curl -fsSL '{url}' | CW_ACCESS_TOKEN='cw_...' python3 - --app-list --mode cng".format(
+    "curl -fsSL '{url}' | CW_ACCESS_TOKEN='cw_...' python3 - --app-list".format(
         url=SCRIPT_RAW_URL,
     )
 )
@@ -930,8 +933,15 @@ def app_php_from_api(app):
     return ""
 
 
+def find_ssh_bin():
+    for cand in (shutil.which("ssh"), "/usr/bin/ssh", "/bin/ssh"):
+        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return ""
+
+
 def fetch_remote_app_php_versions(mode, server_ip, ssh_user, cng_argv):
-    """Cat applications.fact on a remote Cloudways server via cng or ssh."""
+    """Cat applications.fact on a remote Cloudways server via cng or key-ssh."""
     if not server_ip:
         return {}
     script = "cat {path} 2>/dev/null || true".format(path=shlex.quote(APPLICATIONS_FACT))
@@ -942,22 +952,260 @@ def fetch_remote_app_php_versions(mode, server_ip, ssh_user, cng_argv):
     return parse_app_php_from_facts(stdout)
 
 
+def server_ssh_credential_candidates(srv):
+    """Ordered (user, password, label) for password-SSH to read applications.fact."""
+    cands = []
+    master_user = str(srv.get("master_user", "") or "").strip()
+    master_pass = str(srv.get("master_password", "") or "").strip()
+    if master_user and master_pass:
+        cands.append((master_user, master_pass, "master"))
+    for app in srv.get("apps") or []:
+        if not isinstance(app, dict):
+            continue
+        su = str(app.get("sys_user", "") or "").strip()
+        sp = str(app.get("sys_password", "") or "").strip()
+        if su and sp:
+            cands.append((su, sp, "app:" + su))
+            break
+    return cands
+
+
+def ssh_password_run(user, host, password, remote_cmd, timeout=45):
+    """Run remote_cmd over SSH with password (sshpass -e or SSH_ASKPASS)."""
+    ssh_bin = find_ssh_bin()
+    if not ssh_bin:
+        return "", False, "ssh binary not found"
+    if not user or not host or not password:
+        return "", False, "missing ssh credentials"
+
+    ssh_base = [
+        ssh_bin,
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "GlobalKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=15",
+        "-o", "NumberOfPasswordPrompts=1",
+        "-o", "PreferredAuthentications=password,keyboard-interactive",
+        "-o", "PubkeyAuthentication=no",
+        "-o", "BatchMode=no",
+        "{}@{}".format(user, host),
+        remote_cmd,
+    ]
+
+    # sshpass -e keeps password off argv
+    if shutil.which("sshpass"):
+        env = os.environ.copy()
+        env["SSHPASS"] = password
+        try:
+            result = subprocess.run(
+                ["sshpass", "-e"] + ssh_base,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                timeout=timeout,
+                env=env,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return "", False, str(exc)
+        out = result.stdout or ""
+        err = (result.stderr or "").strip()
+        if result.returncode != 0 and not out.strip():
+            return out, False, err or "sshpass exit {}".format(result.returncode)
+        return out, True, err
+
+    # OpenSSH ASKPASS (no sshpass)
+    pwd_path = ask_path = None
+    try:
+        fd, pwd_path = tempfile.mkstemp(prefix="cwphp_pwd_")
+        os.write(fd, password.encode("utf-8"))
+        os.close(fd)
+        os.chmod(pwd_path, 0o600)
+        fd, ask_path = tempfile.mkstemp(prefix="cwphp_ask_")
+        os.write(
+            fd,
+            ("#!/bin/sh\ncat {p}\n".format(p=shlex.quote(pwd_path))).encode("utf-8"),
+        )
+        os.close(fd)
+        os.chmod(ask_path, 0o700)
+        env = os.environ.copy()
+        env["SSH_ASKPASS"] = ask_path
+        env["SSH_ASKPASS_REQUIRE"] = "force"
+        env["DISPLAY"] = env.get("DISPLAY") or "none:0"
+        try:
+            result = subprocess.run(
+                ssh_base,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                timeout=timeout,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except TypeError:
+            # Python 3.5 may lack start_new_session kw on some builds; use preexec
+            result = subprocess.run(
+                ssh_base,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                timeout=timeout,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                preexec_fn=os.setsid,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return "", False, str(exc)
+        out = result.stdout or ""
+        err = (result.stderr or "").strip()
+        if result.returncode != 0 and not out.strip():
+            return out, False, err or "ssh exit {}".format(result.returncode)
+        return out, True, err
+    finally:
+        for p in (pwd_path, ask_path):
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+
+def fetch_facts_via_password_ssh(srv):
+    """SSH with master/app password from GET /server and cat applications.fact."""
+    ip = str(srv.get("public_ip", "") or srv.get("ip", "") or "").strip()
+    if not ip:
+        return {}, "no-ip"
+    remote_cmd = "cat {path} 2>/dev/null || true".format(path=shlex.quote(APPLICATIONS_FACT))
+    last_err = "no credentials"
+    for user, password, label in server_ssh_credential_candidates(srv):
+        stdout, ok, detail = ssh_password_run(user, ip, password, remote_cmd)
+        if ok:
+            parsed = parse_app_php_from_facts(stdout)
+            if parsed:
+                return parsed, "pass-ssh:" + label
+            last_err = "empty facts via {}".format(label)
+            continue
+        last_err = "{}: {}".format(label, (detail or "")[:160])
+    return {}, last_err
+
+
+def detect_source_public_ip(servers, local_sid):
+    if local_sid:
+        for srv in servers:
+            if str(srv.get("id", "")) == str(local_sid):
+                ip = str(srv.get("public_ip", "") or "").strip()
+                if ip:
+                    return ip
+    # Best-effort external IP (may fail on locked-down boxes)
+    for url in (
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+    ):
+        try:
+            resp = requests.get(url, timeout=8)
+            if resp.status_code == 200:
+                ip = (resp.text or "").strip()
+                if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+                    return ip
+        except requests.RequestException:
+            continue
+    return ""
+
+
+def get_sftp_whitelist(token, server_id):
+    """Return (ip_list, policy_hint) for SSH/SFTP whitelist."""
+    for base in (API_V2, API_V1):
+        body = api_get_json(
+            token, base + "/security/whitelisted", {"server_id": server_id},
+        )
+        if body is None:
+            continue
+        ips = body.get("ip_list") or body.get("ips") or body.get("ip") or []
+        if isinstance(ips, str):
+            ips = [x.strip() for x in ips.replace(",", " ").split() if x.strip()]
+        if not isinstance(ips, list):
+            ips = []
+        policy = str(
+            body.get("ip_policy") or body.get("ipPolicy") or body.get("policy") or ""
+        ).strip()
+        return [str(x).strip() for x in ips if str(x).strip()], policy
+    return [], ""
+
+
+def set_sftp_whitelist(token, server_id, ips, ip_policy="block_all"):
+    """Replace SSH/SFTP whitelist (destructive — caller must restore)."""
+    form = {
+        "server_id": str(server_id),
+        "ip": ",".join(ips) if isinstance(ips, list) else str(ips),
+        "type": "sftp",
+        "tab": "sftp",
+        "ipPolicy": ip_policy,
+        "ip_policy": ip_policy,
+    }
+    last_err = ""
+    for base in (API_V2, API_V1):
+        try:
+            resp = requests.post(
+                base + "/security/whitelisted",
+                headers=auth_headers(token),
+                data=form,
+                timeout=45,
+            )
+            if resp.status_code < 400:
+                return True, ""
+            last_err = "HTTP {} {}".format(resp.status_code, resp.text[:160])
+        except requests.RequestException as exc:
+            last_err = str(exc)
+    return False, last_err
+
+
+def with_temp_ssh_whitelist(token, server_id, source_ip, enabled):
+    """
+    Context-style helper: temporarily ensure source_ip is on SSH whitelist.
+    Returns (restore_fn or None, note).
+    """
+    if not enabled or not source_ip or not server_id:
+        return None, ""
+    old_ips, old_policy = get_sftp_whitelist(token, server_id)
+    policy = old_policy or "block_all"
+    if policy.lower() in ("allow_all", "allow"):
+        return None, "policy already allow_all"
+    if source_ip in old_ips:
+        return None, "source IP already whitelisted"
+
+    new_ips = list(old_ips) + [source_ip]
+    ok, err = set_sftp_whitelist(token, server_id, new_ips, ip_policy=policy or "block_all")
+    if not ok:
+        return None, "whitelist update failed: {}".format(err)
+
+    def restore():
+        set_sftp_whitelist(
+            token, server_id, old_ips, ip_policy=policy or "block_all",
+        )
+
+    return restore, "added {} to SSH whitelist".format(source_ip)
+
+
 def resolve_php_fetch_modes(args):
     """
     Ordered remote modes for applications.fact.
 
-    Explicit --mode cng|ssh wins. Otherwise try cng (if on PATH), then ssh.
-    GET /server does not include per-app PHP; playground only documents
-    POST /apps/{app_id}/php/version (write) and server package_versions.php.
+    Prefer cng when present; always keep password-ssh available (uses
+    master_user/master_password from GET /server) so customer-box runs work.
     """
     mode = getattr(args, "mode", None)
-    if mode in ("cng", "ssh"):
-        return [mode]
     modes = []
-    if shutil.which("cng"):
+    if mode == "cng":
         modes.append("cng")
-    if shutil.which("ssh"):
+    elif mode == "ssh":
         modes.append("ssh")
+    else:
+        if shutil.which("cng"):
+            modes.append("cng")
+        if find_ssh_bin():
+            modes.append("ssh")
+    # Password SSH works without cw-proxy when GET /server returns master_password
+    modes.append("pass-ssh")
     return modes
 
 
@@ -973,126 +1221,43 @@ def api_get_json(token, url, params=None, timeout=45):
         return None
 
 
-def merge_php_into_apps(servers, php_by_app_id):
-    """Copy php_version onto nested app dicts when API detail endpoints provide it."""
-    if not php_by_app_id:
-        return
-    for srv in servers:
-        for app in srv.get("apps") or []:
-            if not isinstance(app, dict):
-                continue
-            if app_php_from_api(app):
-                continue
-            aid = str(app.get("id", "") or "").strip()
-            if aid and php_by_app_id.get(aid):
-                app["php_version"] = php_by_app_id[aid]
-
-
-def enrich_php_from_api_details(token, servers):
-    """
-    Best-effort: some v2 detail routes occasionally expose php_version.
-    Documented playground has no dedicated per-app PHP GET — this is optional.
-    """
-    php_by_app_id = {}
-
-    # Paginated flexible apps / applications lists
-    for path in ("/apps/flexible", "/applications", "/apps"):
-        url = API_V2 + path
-        pages = 0
-        while url and pages < 20:
-            pages += 1
-            body = api_get_json(token, url)
-            if body is None:
-                break
-            chunk = []
-            if isinstance(body, dict):
-                chunk = (
-                    body.get("applications")
-                    or body.get("apps")
-                    or body.get("data")
-                    or []
-                )
-            elif isinstance(body, list):
-                chunk = body
-            if not isinstance(chunk, list):
-                chunk = []
-            for app in chunk:
-                if not isinstance(app, dict):
-                    continue
-                aid = str(app.get("id") or app.get("app_id") or "").strip()
-                php = app_php_from_api(app)
-                if aid and php:
-                    php_by_app_id[aid] = php
-            nxt = None
-            if isinstance(body, dict):
-                pag = body.get("pagination") or {}
-                for key in ("next", "next_page_url", "next_url"):
-                    cand = pag.get(key) or body.get(key)
-                    if cand:
-                        nxt = str(cand)
-                        break
-            url = nxt
-        if php_by_app_id:
-            break
-
-    # Per-server v2 detail (GET /servers/{id} — not GET /server/{id})
-    for srv in servers:
-        sid = str(srv.get("id", "")).strip()
-        if not sid:
-            continue
-        body = api_get_json(token, API_V2 + "/servers/" + sid)
-        if not isinstance(body, dict):
-            continue
-        detail = body.get("server") or body.get("data") or body
-        if not isinstance(detail, dict):
-            continue
-        for app in detail.get("apps") or []:
-            if not isinstance(app, dict):
-                continue
-            aid = str(app.get("id", "") or "").strip()
-            php = app_php_from_api(app)
-            if aid and php:
-                php_by_app_id[aid] = php
-        time.sleep(0.15)
-
-    merge_php_into_apps(servers, php_by_app_id)
-    return php_by_app_id
-
-
 def collect_php_by_server(token, servers, args):
     """
-    Per-server sys_user -> PHP version.
+    Per-server sys_user -> PHP version from applications.fact.
 
-    Prefer /etc/ansible/facts.d/applications.fact [app_php_version]
-    (local or via cng/ssh). API list endpoints usually omit per-app PHP;
-    detail enrichment is best-effort only.
+    Order: local facts -> cng/key-ssh -> password-ssh (master/app from GET /server).
     """
     local_sid = detect_local_server_id()
     local_map = read_local_app_php_versions() if on_cloudways_server() else {}
     remote_modes = resolve_php_fetch_modes(args)
     ssh_user = os.environ.get("SSH_USER", "").strip() or "root"
     cng_argv = shlex.split(os.environ.get("CNG_CMD", "").strip() or "cng")
+    do_whitelist = bool(getattr(args, "php_whitelist", False))
+    source_ip = detect_source_public_ip(servers, local_sid) if do_whitelist else ""
 
     if "cng" in remote_modes and not shutil.which(cng_argv[0]):
-        print("  [warn] `{}` not found; skipping cng for PHP facts.".format(cng_argv[0]))
+        print("  [warn] `{}` not found; falling back to ssh/password-ssh.".format(
+            cng_argv[0],
+        ))
         remote_modes = [m for m in remote_modes if m != "cng"]
 
-    if not remote_modes:
-        print(
-            "  [note] No cng/ssh for remote applications.fact. "
-            "Cloudways API has no per-app PHP GET in the playground "
-            "(POST /apps/{{id}}/php/version is write-only; "
-            "GET /server/manage/settings is server package PHP only)."
-        )
-        print("  [note] From cw-proxy, re-run:")
-        print("         {}".format(SCRIPT_CURL_APP_LIST))
+    if "ssh" in remote_modes and not find_ssh_bin():
+        print("  [warn] ssh binary not found; password-ssh also unavailable.")
+        remote_modes = [m for m in remote_modes if m != "ssh"]
+        # pass-ssh also needs ssh binary
+        if "pass-ssh" in remote_modes and not find_ssh_bin():
+            remote_modes = [m for m in remote_modes if m != "pass-ssh"]
 
-    print("  [api] Checking v2 detail endpoints for php_version (usually empty) ...")
-    api_hits = enrich_php_from_api_details(token, servers)
-    if api_hits:
-        print("  [api] Found php_version on {} app detail record(s).".format(len(api_hits)))
-    else:
-        print("  [api] No per-app php_version in API detail responses.")
+    if do_whitelist:
+        print("  [note] --php-whitelist enabled (source IP: {}).".format(
+            source_ip or "unknown",
+        ))
+
+    if not any(m in remote_modes for m in ("cng", "ssh", "pass-ssh")):
+        print(
+            "  [note] No remote transport for applications.fact "
+            "(need cng or ssh). API has no per-app PHP GET."
+        )
 
     php_by_server = {}
     missing_servers = []
@@ -1102,19 +1267,42 @@ def collect_php_by_server(token, servers, args):
         apps = [a for a in (srv.get("apps") or []) if isinstance(a, dict)]
         php_map = {}
         source = "none"
+        restore_wl = None
 
         if local_sid and sid == str(local_sid) and local_map:
             php_map = dict(local_map)
             source = "local-facts"
         elif ip:
             for mode in remote_modes:
-                remote_map = fetch_remote_app_php_versions(
-                    mode, ip, ssh_user, cng_argv,
-                )
-                if remote_map:
-                    php_map = remote_map
-                    source = "{}-facts".format(mode)
-                    break
+                if mode in ("cng", "ssh"):
+                    remote_map = fetch_remote_app_php_versions(
+                        mode, ip, ssh_user, cng_argv,
+                    )
+                    if remote_map:
+                        php_map = remote_map
+                        source = "{}-facts".format(mode)
+                        break
+                elif mode == "pass-ssh":
+                    if do_whitelist and source_ip:
+                        restore_wl, wl_note = with_temp_ssh_whitelist(
+                            token, sid, source_ip, True,
+                        )
+                        if wl_note:
+                            print("      [{}] {}".format(sid, wl_note))
+                        if restore_wl:
+                            time.sleep(2)
+                    remote_map, detail = fetch_facts_via_password_ssh(srv)
+                    if restore_wl:
+                        try:
+                            restore_wl()
+                        except Exception:
+                            print("      [warn] failed to restore SSH whitelist on {}".format(sid))
+                        restore_wl = None
+                    if remote_map:
+                        php_map = remote_map
+                        source = detail
+                        break
+                    print("      [warn] pass-ssh {}: {}".format(ip, detail))
 
         for app in apps:
             su = str(app.get("sys_user", "") or "").strip()
@@ -1137,13 +1325,14 @@ def collect_php_by_server(token, servers, args):
         print("    {} ({}) PHP via {} — {}/{} app version(s)".format(
             sid or "?", ip or "no-ip", source, len(php_map), expected,
         ))
-        if expected and len(php_map) < expected and source in ("none", "api-detail"):
+        if expected and len(php_map) < expected and not str(source).endswith("facts") and not str(source).startswith("pass-ssh") and source != "local-facts":
             missing_servers.append(ip or sid)
 
     if missing_servers:
         print(
             "  [warn] PHP still missing for {} server(s). "
-            "Re-run from cw-proxy: --app-list --mode cng".format(len(missing_servers))
+            "Try --php-whitelist (temp SSH allowlist) or run from cw-proxy "
+            "with --mode cng.".format(len(missing_servers))
         )
     return php_by_server
 
@@ -1737,8 +1926,13 @@ def parse_cli_args(argv):
     parser.add_argument(
         "--app-list", action="store_true",
         help="CSV: server_ip, app_name, php_version, app_url "
-             "(PHP from applications.fact via local/cng/ssh — use --mode cng "
-             "from cw-proxy; API has no per-app PHP GET)",
+             "(PHP from applications.fact via local/cng/ssh/password-ssh; "
+             "API has no per-app PHP GET)",
+    )
+    parser.add_argument(
+        "--php-whitelist", action="store_true",
+        help="With --app-list password-ssh: temporarily add this host's public "
+             "IP to each target server's SSH/SFTP whitelist, then restore",
     )
     parser.add_argument(
         "--include-staging", action="store_true",
