@@ -5,10 +5,10 @@ Cloudways per-application PHP version audit and bulk update.
 Uses the same auth model as sl_enable_cronoptimizer.py:
   CW_ACCESS_TOKEN (cw_... Bearer on API v2), or CW_EMAIL + CW_API_KEY (OAuth).
 
-Update endpoints probed (HTTP 405 = wrong method on that path):
-  PUT  /app/manage/php_version   (form: server_id, app_id, php_version)
-  POST /apps/{app_id}/php/version  (JSON: server_id, php_version)
-  (+ other PUT/POST/PATCH fallbacks)
+Primary update (API v2 playground):
+  POST /apps/{app_id}/php/version
+  JSON: {"version": "8.3"}   # field is "version", not "php_version"
+  (optional server_id)
 
 Use --debug --stop-on-fail to print every probe result.
 
@@ -510,57 +510,48 @@ def post_php_version(
     Cloudways has shifted routes/methods; 405 means wrong HTTP method on that
     path. Try PUT and POST on manage + playground apps/.../php/version.
     """
-    form_data = {"server_id": str(server_id), "app_id": str(app_id), "php_version": target}
-    # Integer IDs (some validators reject string digits)
-    form_data_int = {
-        "server_id": int(server_id) if str(server_id).isdigit() else server_id,
-        "app_id": int(app_id) if str(app_id).isdigit() else app_id,
-        "php_version": target,
-    }
-    json_srv = {"php_version": target, "server_id": server_id}
-    json_srv_int = {
-        "php_version": target,
-        "server_id": int(server_id) if str(server_id).isdigit() else server_id,
-    }
-    json_full = {
-        "php_version": target,
-        "server_id": server_id,
-        "app_id": app_id,
-    }
-    json_full_int = {
-        "php_version": target,
-        "server_id": int(server_id) if str(server_id).isdigit() else server_id,
-        "app_id": int(app_id) if str(app_id).isdigit() else app_id,
-    }
-    json_min = {"php_version": target}
+    # Playground POST /apps/{id}/php/version expects field name "version"
+    # (422 "Version is required" when only php_version is sent).
+    sid_i = int(server_id) if str(server_id).isdigit() else server_id
+    aid_i = int(app_id) if str(app_id).isdigit() else app_id
+
+    form_php = {"server_id": str(server_id), "app_id": str(app_id), "php_version": target}
+    form_ver = {"server_id": str(server_id), "app_id": str(app_id), "version": target}
+    form_ver_i = {"server_id": sid_i, "app_id": aid_i, "version": target}
+
+    json_ver_min = {"version": target}
+    json_ver_srv = {"version": target, "server_id": sid_i}
+    json_ver_full = {"version": target, "server_id": sid_i, "app_id": aid_i}
+    json_php_min = {"php_version": target}
+    json_php_srv = {"php_version": target, "server_id": sid_i}
+    json_php_full = {"php_version": target, "server_id": sid_i, "app_id": aid_i}
+    # Some gateways accept both keys
+    json_both = {"version": target, "php_version": target, "server_id": sid_i}
 
     ctype_form = {"Content-Type": "application/x-www-form-urlencoded"}
     ctype_json = {"Content-Type": "application/json"}
 
-    # Order: PUT manage (405 on POST is common), then playground POST php/version
+    # Working path from probe: POST /apps/{id}/php/version (needs "version")
     attempts: list[tuple[str, str, dict, Any]] = [
-        ("PUT", f"{API_V2}/app/manage/php_version", ctype_form, form_data),
-        ("PUT", f"{API_V1}/app/manage/php_version", ctype_form, form_data),
-        ("PUT", f"{API_V2}/app/manage/php_version", ctype_json, json_full),
-        ("PUT", f"{API_V1}/app/manage/php_version", ctype_json, json_full),
-        ("PUT", f"{API_V2}/app/manage/php_version", ctype_form, form_data_int),
-        ("POST", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_srv),
-        ("POST", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_srv_int),
-        ("POST", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_full),
-        ("POST", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_full_int),
-        ("POST", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_min),
-        ("POST", f"{API_V2}/apps/{app_id}/php/version?server_id={server_id}", ctype_json, json_min),
-        ("POST", f"{API_V2}/apps/{app_id}/php/version", ctype_form, form_data),
-        ("PUT", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_srv),
-        ("PUT", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_full),
-        ("POST", f"{API_V2}/applications/{app_id}/php/version", ctype_json, json_srv),
-        ("PUT", f"{API_V2}/applications/{app_id}/php/version", ctype_json, json_srv),
-        ("POST", f"{API_V2}/apps/{app_id}/php-version", ctype_json, json_srv),
-        ("PUT", f"{API_V2}/apps/{app_id}/php-version", ctype_json, json_srv),
-        ("POST", f"{API_V2}/app/manage/php_version", ctype_form, form_data),
-        ("POST", f"{API_V1}/app/manage/php_version", ctype_form, form_data),
-        ("PATCH", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_srv),
-        ("PATCH", f"{API_V2}/app/manage/php_version", ctype_form, form_data),
+        ("POST", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_ver_min),
+        ("POST", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_ver_srv),
+        ("POST", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_ver_full),
+        ("POST", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_both),
+        ("POST", f"{API_V2}/apps/{app_id}/php/version?server_id={server_id}", ctype_json, json_ver_min),
+        ("POST", f"{API_V2}/apps/{app_id}/php/version", ctype_form, form_ver),
+        ("POST", f"{API_V2}/apps/{app_id}/php/version", ctype_form, form_ver_i),
+        ("PUT", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_ver_min),
+        ("PUT", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_ver_srv),
+        ("POST", f"{API_V2}/applications/{app_id}/php/version", ctype_json, json_ver_min),
+        ("POST", f"{API_V2}/applications/{app_id}/php/version", ctype_json, json_ver_srv),
+        # Legacy field name php_version (kept as fallback)
+        ("POST", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_php_min),
+        ("POST", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_php_srv),
+        ("POST", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_php_full),
+        ("POST", f"{API_V2}/app/manage/php_version", ctype_form, form_php),
+        ("PUT", f"{API_V2}/app/manage/php_version", ctype_form, form_php),
+        ("POST", f"{API_V1}/app/manage/php_version", ctype_form, form_php),
+        ("PUT", f"{API_V1}/app/manage/php_version", ctype_form, form_php),
     ]
 
     probe_log: list[str] = []
