@@ -5,30 +5,28 @@ Cloudways per-application PHP version audit and bulk update.
 Uses the same auth model as sl_enable_cronoptimizer.py:
   CW_ACCESS_TOKEN (cw_... Bearer on API v2), or CW_EMAIL + CW_API_KEY (OAuth).
 
-Primary update endpoint (API v1 / v2, matches Cloudways MCP set_php_version):
-  POST /app/manage/php_version
-  Content-Type: application/x-www-form-urlencoded
-  server_id, app_id, php_version=8.3
+Primary update endpoint (Cloudways playground / API v2):
+  POST /apps/{app_id}/php/version
+  JSON: {"server_id": 123, "php_version": "8.3"}
+
+Legacy POST /app/manage/php_version often returns HTTP 405 — do not use as primary.
 
 Audit:
-  GET /server or GET /server/{id} — each app may expose php_version (or phpVersion).
-
-On-server verification (when run on the Cloudways box):
-  /home/master/applications/<sys_user>/.php_version
-  readlink /home/master/applications/<sys_user>/.cw/bin/php  -> /usr/bin/php8.3
+  GET /server — apps may omit php_version; on-server reads applications.fact /
+  .php_version when available.
 
 Playground (https://developers.cloudways.com/docs/ → Playground):
   1. Authorize (OAuth or paste cw_ token).
-  2. GET /server — note server id, app id, current php_version per app.
-  3. POST /app/manage/php_version with server_id, app_id, php_version=8.3.
+  2. GET /server — note server id, app id.
+  3. POST /apps/{app_id}/php/version with server_id + php_version.
   4. GET /operation/{operation_id} until is_completed=1.
 
 Examples:
   export CW_ACCESS_TOKEN='cw_...'
-  ./cw_app_php_bulk.py --server-id 123456 --audit
-  ./cw_app_php_bulk.py --server-id 123456 --apply --target 8.3 --dry-run
-  ./cw_app_php_bulk.py --server-id 123456 --apply --target 8.3
-  ./cw_app_php_bulk.py --all-servers --audit --csv > php_audit.csv
+  curl -fsSL '.../cw_app_php_bulk.py' | CW_ACCESS_TOKEN='cw_...' python3 - \\
+    --server-id 123456 --apply --target 8.3 --dry-run
+  curl -fsSL '.../cw_app_php_bulk.py' | CW_ACCESS_TOKEN='cw_...' python3 - \\
+    --all-servers --apply --target 8.3
 
 Env: CW_ACCESS_TOKEN, or CW_EMAIL + CW_API_KEY
 """
@@ -155,9 +153,46 @@ def app_php_from_api(app: dict) -> str:
     return ""
 
 
-def local_php_version(sys_user: str) -> str:
+APPLICATIONS_FACT = Path("/etc/ansible/facts.d/applications.fact")
+
+
+def parse_app_php_from_facts(text: str) -> dict[str, str]:
+    """Parse [app_php_version] from applications.fact."""
+    versions: dict[str, str] = {}
+    in_section = False
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            in_section = line[1:-1].strip().lower() == "app_php_version"
+            continue
+        if not in_section or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        su = key.strip()
+        php = normalize_php_version(val)
+        if su and php:
+            versions[su] = php
+    return versions
+
+
+def read_local_facts_php() -> dict[str, str]:
+    try:
+        return parse_app_php_from_facts(APPLICATIONS_FACT.read_text(errors="ignore"))
+    except OSError:
+        return {}
+
+
+def local_php_version(sys_user: str, facts_map: Optional[dict[str, str]] = None) -> str:
     if not sys_user:
         return ""
+    if facts_map and facts_map.get(sys_user):
+        return facts_map[sys_user]
+    if APPLICATIONS_FACT.is_file():
+        mapped = read_local_facts_php().get(sys_user)
+        if mapped:
+            return mapped
     base = APPS_ROOT / sys_user
     dot = base / ".php_version"
     if dot.is_file():
@@ -326,7 +361,7 @@ def build_app_rows(
             continue
         sys_user = str(app.get("sys_user") or app.get("sysUser") or "")
         api_php = app_php_from_api(app)
-        local_php = local_php_version(sys_user) if APPS_ROOT.is_dir() else ""
+        local_php = local_php_version(sys_user)
         if not sid and sys_user:
             sid, aid_from_nginx = local_ids_for_sys_user(sys_user)
             if aid_from_nginx and not aid:
@@ -416,7 +451,7 @@ def iter_apps(
                 continue
             sys_user = str(app.get("sys_user") or app.get("sysUser") or "")
             api_php = app_php_from_api(app)
-            local_php = local_php_version(sys_user) if APPS_ROOT.is_dir() else ""
+            local_php = local_php_version(sys_user)
             rows.append(
                 {
                     "server_id": sid,
@@ -466,29 +501,43 @@ def post_php_version(
     app_id: str,
     target: str,
 ) -> tuple[Optional[str], str]:
-    """Try known Cloudways PHP version endpoints; return (operation_id, error)."""
+    """
+    Update per-app PHP version. Return (operation_id, error).
+
+    Playground primary route (API v2):
+      POST /apps/{app_id}/php/version
+      {"server_id": ..., "php_version": "8.3"}
+    """
     form_data = {"server_id": server_id, "app_id": app_id, "php_version": target}
-    json_min = {"php_version": target}
     json_srv = {"php_version": target, "server_id": server_id}
-    attempts: list[tuple[str, str, dict, Any]] = []
-    if api_base == API_V2:
-        attempts.extend(
-            [
-                ("PUT", f"{api_base}/applications/{app_id}/php-version", {"Content-Type": "application/json"}, json_min),
-                ("PUT", f"{api_base}/applications/{app_id}/php-version?server_id={server_id}", {"Content-Type": "application/json"}, json_min),
-                ("PUT", f"{api_base}/applications/{app_id}/php-version", {"Content-Type": "application/json"}, json_srv),
-                ("PATCH", f"{api_base}/applications/{app_id}/php-version", {"Content-Type": "application/json"}, json_min),
-                ("POST", f"{api_base}/applications/{app_id}/php-version", {"Content-Type": "application/json"}, json_srv),
-                ("PUT", f"{api_base}/apps/{app_id}/php-version", {"Content-Type": "application/json"}, json_srv),
-                ("POST", f"{api_base}/apps/{app_id}/php-version", {"Content-Type": "application/json"}, json_srv),
-            ]
-        )
-    attempts.extend(
-        [
-            ("POST", f"{API_V2}/app/manage/php_version", {"Content-Type": "application/x-www-form-urlencoded"}, form_data),
-            ("POST", f"{API_V1}/app/manage/php_version", {"Content-Type": "application/x-www-form-urlencoded"}, form_data),
-        ]
-    )
+    json_srv_int = {
+        "php_version": target,
+        "server_id": int(server_id) if str(server_id).isdigit() else server_id,
+    }
+    json_full = {
+        "php_version": target,
+        "server_id": server_id,
+        "app_id": app_id,
+    }
+    json_min = {"php_version": target}
+
+    # Documented path first (slash: php/version). Hyphen variants are legacy probes.
+    attempts: list[tuple[str, str, dict, Any]] = [
+        ("POST", f"{API_V2}/apps/{app_id}/php/version", {"Content-Type": "application/json"}, json_srv),
+        ("POST", f"{API_V2}/apps/{app_id}/php/version", {"Content-Type": "application/json"}, json_srv_int),
+        ("POST", f"{API_V2}/apps/{app_id}/php/version", {"Content-Type": "application/json"}, json_full),
+        ("POST", f"{API_V2}/apps/{app_id}/php/version?server_id={server_id}", {"Content-Type": "application/json"}, json_min),
+        ("POST", f"{API_V2}/apps/{app_id}/php/version", {"Content-Type": "application/x-www-form-urlencoded"}, form_data),
+        ("PUT", f"{API_V2}/apps/{app_id}/php/version", {"Content-Type": "application/json"}, json_srv),
+        ("POST", f"{API_V2}/applications/{app_id}/php/version", {"Content-Type": "application/json"}, json_srv),
+        ("POST", f"{API_V2}/apps/{app_id}/php-version", {"Content-Type": "application/json"}, json_srv),
+        ("PUT", f"{API_V2}/apps/{app_id}/php-version", {"Content-Type": "application/json"}, json_srv),
+        ("POST", f"{API_V2}/applications/{app_id}/php-version", {"Content-Type": "application/json"}, json_srv),
+        ("PUT", f"{API_V2}/applications/{app_id}/php-version", {"Content-Type": "application/json"}, json_srv),
+        # Legacy (often HTTP 405 on current platform)
+        ("POST", f"{API_V2}/app/manage/php_version", {"Content-Type": "application/x-www-form-urlencoded"}, form_data),
+        ("POST", f"{API_V1}/app/manage/php_version", {"Content-Type": "application/x-www-form-urlencoded"}, form_data),
+    ]
 
     last_err = ""
     for method, url, extra_headers, body in attempts:
@@ -506,7 +555,7 @@ def post_php_version(
             try:
                 payload = resp.json()
             except ValueError:
-                payload = {"raw": resp.text[:400]}
+                payload = {"raw": (resp.text or "")[:400]}
 
             message = str(payload.get("message", ""))
             if message.startswith("An operation is already in progress"):
@@ -520,12 +569,18 @@ def post_php_version(
                     return str(op_id), ""
                 if payload.get("status") is True or str(payload.get("status", "")).lower() == "success":
                     return "", ""
+                # Some success bodies only return operation nested
+                op = payload.get("operation") or {}
+                if isinstance(op, dict) and op.get("id"):
+                    return str(op.get("id")), ""
                 last_err = f"{method} {url}: HTTP {resp.status_code} {payload}"
                 break
 
-            if resp.status_code == 404:
-                last_err = f"{method} {url}: HTTP 404"
+            # Wrong route / method — try next candidate
+            if resp.status_code in (404, 405):
+                last_err = f"{method} {url}: HTTP {resp.status_code} {payload}"
                 break
+
             last_err = f"{method} {url}: HTTP {resp.status_code} {payload}"
             break
 
