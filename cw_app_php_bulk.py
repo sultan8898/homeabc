@@ -5,11 +5,12 @@ Cloudways per-application PHP version audit and bulk update.
 Uses the same auth model as sl_enable_cronoptimizer.py:
   CW_ACCESS_TOKEN (cw_... Bearer on API v2), or CW_EMAIL + CW_API_KEY (OAuth).
 
-Primary update endpoint (Cloudways playground / API v2):
-  POST /apps/{app_id}/php/version
-  JSON: {"server_id": 123, "php_version": "8.3"}
+Update endpoints probed (HTTP 405 = wrong method on that path):
+  PUT  /app/manage/php_version   (form: server_id, app_id, php_version)
+  POST /apps/{app_id}/php/version  (JSON: server_id, php_version)
+  (+ other PUT/POST/PATCH fallbacks)
 
-Legacy POST /app/manage/php_version often returns HTTP 405 — do not use as primary.
+Use --debug --stop-on-fail to print every probe result.
 
 Audit:
   GET /server — apps may omit php_version; on-server reads applications.fact /
@@ -500,15 +501,22 @@ def post_php_version(
     server_id: str,
     app_id: str,
     target: str,
+    *,
+    debug: bool = False,
 ) -> tuple[Optional[str], str]:
     """
     Update per-app PHP version. Return (operation_id, error).
 
-    Playground primary route (API v2):
-      POST /apps/{app_id}/php/version
-      {"server_id": ..., "php_version": "8.3"}
+    Cloudways has shifted routes/methods; 405 means wrong HTTP method on that
+    path. Try PUT and POST on manage + playground apps/.../php/version.
     """
-    form_data = {"server_id": server_id, "app_id": app_id, "php_version": target}
+    form_data = {"server_id": str(server_id), "app_id": str(app_id), "php_version": target}
+    # Integer IDs (some validators reject string digits)
+    form_data_int = {
+        "server_id": int(server_id) if str(server_id).isdigit() else server_id,
+        "app_id": int(app_id) if str(app_id).isdigit() else app_id,
+        "php_version": target,
+    }
     json_srv = {"php_version": target, "server_id": server_id}
     json_srv_int = {
         "php_version": target,
@@ -519,26 +527,43 @@ def post_php_version(
         "server_id": server_id,
         "app_id": app_id,
     }
+    json_full_int = {
+        "php_version": target,
+        "server_id": int(server_id) if str(server_id).isdigit() else server_id,
+        "app_id": int(app_id) if str(app_id).isdigit() else app_id,
+    }
     json_min = {"php_version": target}
 
-    # Documented path first (slash: php/version). Hyphen variants are legacy probes.
+    ctype_form = {"Content-Type": "application/x-www-form-urlencoded"}
+    ctype_json = {"Content-Type": "application/json"}
+
+    # Order: PUT manage (405 on POST is common), then playground POST php/version
     attempts: list[tuple[str, str, dict, Any]] = [
-        ("POST", f"{API_V2}/apps/{app_id}/php/version", {"Content-Type": "application/json"}, json_srv),
-        ("POST", f"{API_V2}/apps/{app_id}/php/version", {"Content-Type": "application/json"}, json_srv_int),
-        ("POST", f"{API_V2}/apps/{app_id}/php/version", {"Content-Type": "application/json"}, json_full),
-        ("POST", f"{API_V2}/apps/{app_id}/php/version?server_id={server_id}", {"Content-Type": "application/json"}, json_min),
-        ("POST", f"{API_V2}/apps/{app_id}/php/version", {"Content-Type": "application/x-www-form-urlencoded"}, form_data),
-        ("PUT", f"{API_V2}/apps/{app_id}/php/version", {"Content-Type": "application/json"}, json_srv),
-        ("POST", f"{API_V2}/applications/{app_id}/php/version", {"Content-Type": "application/json"}, json_srv),
-        ("POST", f"{API_V2}/apps/{app_id}/php-version", {"Content-Type": "application/json"}, json_srv),
-        ("PUT", f"{API_V2}/apps/{app_id}/php-version", {"Content-Type": "application/json"}, json_srv),
-        ("POST", f"{API_V2}/applications/{app_id}/php-version", {"Content-Type": "application/json"}, json_srv),
-        ("PUT", f"{API_V2}/applications/{app_id}/php-version", {"Content-Type": "application/json"}, json_srv),
-        # Legacy (often HTTP 405 on current platform)
-        ("POST", f"{API_V2}/app/manage/php_version", {"Content-Type": "application/x-www-form-urlencoded"}, form_data),
-        ("POST", f"{API_V1}/app/manage/php_version", {"Content-Type": "application/x-www-form-urlencoded"}, form_data),
+        ("PUT", f"{API_V2}/app/manage/php_version", ctype_form, form_data),
+        ("PUT", f"{API_V1}/app/manage/php_version", ctype_form, form_data),
+        ("PUT", f"{API_V2}/app/manage/php_version", ctype_json, json_full),
+        ("PUT", f"{API_V1}/app/manage/php_version", ctype_json, json_full),
+        ("PUT", f"{API_V2}/app/manage/php_version", ctype_form, form_data_int),
+        ("POST", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_srv),
+        ("POST", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_srv_int),
+        ("POST", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_full),
+        ("POST", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_full_int),
+        ("POST", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_min),
+        ("POST", f"{API_V2}/apps/{app_id}/php/version?server_id={server_id}", ctype_json, json_min),
+        ("POST", f"{API_V2}/apps/{app_id}/php/version", ctype_form, form_data),
+        ("PUT", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_srv),
+        ("PUT", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_full),
+        ("POST", f"{API_V2}/applications/{app_id}/php/version", ctype_json, json_srv),
+        ("PUT", f"{API_V2}/applications/{app_id}/php/version", ctype_json, json_srv),
+        ("POST", f"{API_V2}/apps/{app_id}/php-version", ctype_json, json_srv),
+        ("PUT", f"{API_V2}/apps/{app_id}/php-version", ctype_json, json_srv),
+        ("POST", f"{API_V2}/app/manage/php_version", ctype_form, form_data),
+        ("POST", f"{API_V1}/app/manage/php_version", ctype_form, form_data),
+        ("PATCH", f"{API_V2}/apps/{app_id}/php/version", ctype_json, json_srv),
+        ("PATCH", f"{API_V2}/app/manage/php_version", ctype_form, form_data),
     ]
 
+    probe_log: list[str] = []
     last_err = ""
     for method, url, extra_headers, body in attempts:
         headers = {**auth_headers(token), **extra_headers}
@@ -550,6 +575,7 @@ def post_php_version(
                     resp = requests.request(method, url, headers=headers, json=body, timeout=45)
             except requests.RequestException as exc:
                 last_err = f"{method} {url}: {exc}"
+                probe_log.append(last_err)
                 break
 
             try:
@@ -563,28 +589,50 @@ def post_php_version(
                 time.sleep(INPROG_WAIT)
                 continue
 
+            short = f"{method} {url} -> HTTP {resp.status_code}"
             if resp.status_code in (200, 201, 202):
                 op_id = payload.get("operation_id") or payload.get("operationId")
                 if op_id:
+                    if debug:
+                        print(f"    [ok] {short} operation_id={op_id}")
                     return str(op_id), ""
                 if payload.get("status") is True or str(payload.get("status", "")).lower() == "success":
+                    if debug:
+                        print(f"    [ok] {short} status=success")
                     return "", ""
-                # Some success bodies only return operation nested
                 op = payload.get("operation") or {}
                 if isinstance(op, dict) and op.get("id"):
                     return str(op.get("id")), ""
-                last_err = f"{method} {url}: HTTP {resp.status_code} {payload}"
+                last_err = f"{short} {payload}"
+                probe_log.append(last_err)
                 break
 
-            # Wrong route / method — try next candidate
+            # Keep probing on 404/405 (wrong path/method)
+            last_err = f"{short} {payload}"
+            probe_log.append(last_err)
+            if debug or resp.status_code not in (404, 405):
+                # Show non-404/405 immediately (403/422 are actionable)
+                if resp.status_code not in (404, 405):
+                    print(f"    [probe] {short} {str(payload)[:180]}")
             if resp.status_code in (404, 405):
-                last_err = f"{method} {url}: HTTP {resp.status_code} {payload}"
                 break
-
-            last_err = f"{method} {url}: HTTP {resp.status_code} {payload}"
+            # 403/401/422 — still try other shapes once, but record
             break
 
-    return None, last_err or "no endpoint accepted the request"
+    if debug and probe_log:
+        print("    [probe] tried {} candidate(s):".format(len(probe_log)))
+        for line in probe_log[:12]:
+            print("      - {}".format(line[:200]))
+        if len(probe_log) > 12:
+            print("      - ... {} more".format(len(probe_log) - 12))
+
+    # Prefer first non-405 error if any (more informative than final legacy 405)
+    preferred = ""
+    for line in probe_log:
+        if "HTTP 405" not in line:
+            preferred = line
+            break
+    return None, preferred or last_err or "no endpoint accepted the request"
 
 
 def print_audit_table(rows: list[dict], csv_out: bool) -> None:
@@ -648,6 +696,16 @@ def main() -> None:
     parser.add_argument(
         "--from-php",
         help="With --apply, only apps on this version (e.g. 7.4). Matches API or local .php_version",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print each PHP-update API probe attempt (method/URL/status)",
+    )
+    parser.add_argument(
+        "--stop-on-fail",
+        action="store_true",
+        help="With --apply, stop after the first failed update (useful with --debug)",
     )
     args = parser.parse_args()
 
@@ -719,10 +777,27 @@ def main() -> None:
             )
             if args.dry_run:
                 continue
-            op_id, err = post_php_version(token, api_base, r["server_id"], r["app_id"], target)
+            # Always debug-probe on the first failure so 405 noise is diagnosable
+            debug_this = bool(args.debug or fail == 0)
+            op_id, err = post_php_version(
+                token,
+                api_base,
+                r["server_id"],
+                r["app_id"],
+                target,
+                debug=debug_this,
+            )
             if err and not op_id:
                 print(f"    x {err}")
                 fail += 1
+                if args.stop_on_fail or (fail == 1 and not args.debug):
+                    if fail == 1 and not args.debug:
+                        print(
+                            "    [hint] Re-run with --debug --stop-on-fail on one app "
+                            "to see every probed URL/method."
+                        )
+                    if args.stop_on_fail:
+                        break
                 continue
             if op_id:
                 print(f"    operation_id={op_id}")
@@ -730,6 +805,8 @@ def main() -> None:
                 if not done:
                     print(f"    x {msg}")
                     fail += 1
+                    if args.stop_on_fail:
+                        break
                     continue
                 print(f"    OK {msg}")
             else:
@@ -739,6 +816,7 @@ def main() -> None:
         print(f"Done: {ok} updated, {fail} failed, {len(rows) - len(pending)} unchanged.")
         if APPS_ROOT.is_dir():
             print("Verify on server: cat /home/master/applications/<sys_user>/.php_version")
+            print("Or: cat /etc/ansible/facts.d/applications.fact  # [app_php_version]")
 
 
 if __name__ == "__main__":
