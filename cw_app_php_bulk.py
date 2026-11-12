@@ -23,11 +23,15 @@ Playground (https://developers.cloudways.com/docs/ → Playground):
   4. GET /operation/{operation_id} until is_completed=1.
 
 Examples:
-  export CW_ACCESS_TOKEN='cw_...'
+  # All servers → 8.3 (dry-run)
   curl -fsSL '.../cw_app_php_bulk.py' | CW_ACCESS_TOKEN='cw_...' python3 - \\
-    --server-id 123456 --apply --target 8.3 --dry-run
-  curl -fsSL '.../cw_app_php_bulk.py' | CW_ACCESS_TOKEN='cw_...' python3 - \\
-    --all-servers --apply --target 8.3
+    --all-servers --apply --target 8.3 --dry-run
+
+  # Only apps currently on 7.4 → 8.3
+  ... python3 - --all-servers --apply --from-php 7.4 --target 8.3
+
+  # Upgrade all except leave 8.2 alone
+  ... python3 - --all-servers --apply --skip-php 8.2 --target 8.3
 
 Env: CW_ACCESS_TOKEN, or CW_EMAIL + CW_API_KEY
 """
@@ -414,21 +418,41 @@ def build_app_rows(
     return sorted(by_key.values(), key=lambda r: (r["server_id"], r["sys_user"] or r["label"]))
 
 
+def parse_php_list(raw: str) -> set[str]:
+    """Comma/space-separated PHP versions -> normalized set, e.g. '7.4,8.0'."""
+    out: set[str] = set()
+    for part in (raw or "").replace(",", " ").split():
+        v = normalize_php_version(part)
+        if v:
+            out.add(v)
+    return out
+
+
 def filter_rows(
     rows: list[dict],
     *,
     sys_users: set[str],
     from_php: str,
+    skip_php: str = "",
 ) -> list[dict]:
     out = rows
     if sys_users:
         out = [r for r in out if r.get("sys_user") in sys_users]
-    if from_php:
-        fp = normalize_php_version(from_php)
+    from_set = parse_php_list(from_php)
+    if from_set:
         out = [
             r
             for r in out
-            if normalize_php_version(r.get("php_effective") or r.get("php_api") or "") == fp
+            if normalize_php_version(r.get("php_effective") or r.get("php_api") or "")
+            in from_set
+        ]
+    skip_set = parse_php_list(skip_php)
+    if skip_set:
+        out = [
+            r
+            for r in out
+            if normalize_php_version(r.get("php_effective") or r.get("php_api") or "")
+            not in skip_set
         ]
     return out
 
@@ -686,7 +710,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--from-php",
-        help="With --apply, only apps on this version (e.g. 7.4). Matches API or local .php_version",
+        help="Only apps currently on these PHP version(s), comma-separated "
+             "(e.g. 7.4 or 7.4,8.0). Matches facts/API php.",
+    )
+    parser.add_argument(
+        "--skip-php",
+        help="Skip apps currently on these PHP version(s), comma-separated "
+             "(e.g. 8.2,8.3). Apps already on --target are always skipped.",
     )
     parser.add_argument(
         "--debug",
@@ -739,7 +769,12 @@ def main() -> None:
     sys_user_filter: set[str] = set()
     if args.sys_users:
         sys_user_filter = {u.strip() for u in args.sys_users.split(",") if u.strip()}
-    rows = filter_rows(rows, sys_users=sys_user_filter, from_php=args.from_php or "")
+    rows = filter_rows(
+        rows,
+        sys_users=sys_user_filter,
+        from_php=args.from_php or "",
+        skip_php=args.skip_php or "",
+    )
     if not rows:
         sys.exit("[ERROR] No applications found for the given scope.")
 
@@ -753,11 +788,12 @@ def main() -> None:
 
     if args.apply:
         pending = [r for r in rows if normalize_php_version(r["php_effective"]) != target]
-        if sys_user_filter or args.from_php:
+        if sys_user_filter or args.from_php or args.skip_php:
             print(
                 f"Filtered scope: {len(rows)} app(s)"
                 + (f", sys_users={len(sys_user_filter)}" if sys_user_filter else "")
                 + (f", from_php={args.from_php}" if args.from_php else "")
+                + (f", skip_php={args.skip_php}" if args.skip_php else "")
             )
         print(f"Target PHP {target} — {len(pending)} app(s) to update, {len(rows) - len(pending)} already match.")
         ok = fail = 0
