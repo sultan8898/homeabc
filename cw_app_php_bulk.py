@@ -79,6 +79,12 @@ SKIP_HREF_RE = re.compile(
     r"\.(?:css|js|png|jpe?g|gif|svg|webp|ico|pdf|zip|woff2?|ttf|eot|mp4|mp3)(?:\?|$)",
     re.I,
 )
+# Domains embedded in Cloudways labels, e.g. "Atlantic Foods (atlanticfoods.com)"
+LABEL_PAREN_DOMAIN_RE = re.compile(r"\(([^()\s]*\.[^()\s]+)\)")
+BARE_DOMAIN_RE = re.compile(
+    r"(?:^|[\s/,])((?:www\.)?(?:[a-z0-9-]+\.)+[a-z]{2,})(?=$|[\s/,])",
+    re.I,
+)
 
 _token_cache: dict[str, Any] = {"token": None, "expires_at": None, "api_base": None}
 
@@ -388,6 +394,12 @@ def build_app_rows(
             sid, aid_from_nginx = local_ids_for_sys_user(sys_user)
             if aid_from_nginx and not aid:
                 aid = aid_from_nginx
+        aliases = app.get("aliases") or []
+        if isinstance(aliases, str):
+            aliases = [a.strip() for a in aliases.split(",") if a.strip()]
+        elif not isinstance(aliases, list):
+            aliases = []
+        aliases = [str(a).strip() for a in aliases if str(a).strip()]
         row = {
             "server_id": sid,
             "server_label": server_labels.get(sid, sid),
@@ -395,7 +407,9 @@ def build_app_rows(
             "label": app.get("label") or app.get("app_label") or sys_user,
             "application": str(app.get("application", "")),
             "sys_user": sys_user,
-            "cname": app.get("cname") or app.get("app_fqdn") or "",
+            "cname": str(app.get("cname") or "").strip(),
+            "app_fqdn": str(app.get("app_fqdn") or app.get("url") or "").strip(),
+            "aliases": aliases,
             "php_api": api_php,
             "php_local": local_php,
             "php_effective": local_php or api_php,
@@ -403,9 +417,19 @@ def build_app_rows(
         key = (row["server_id"], row["app_id"])
         if key in by_key:
             prev = by_key[key]
-            for field in ("php_api", "php_local", "php_effective", "sys_user", "cname", "label"):
+            for field in (
+                "php_api",
+                "php_local",
+                "php_effective",
+                "sys_user",
+                "cname",
+                "app_fqdn",
+                "label",
+            ):
                 if not prev.get(field) and row.get(field):
                     prev[field] = row[field]
+            if not prev.get("aliases") and row.get("aliases"):
+                prev["aliases"] = row["aliases"]
         else:
             by_key[key] = row
 
@@ -427,6 +451,8 @@ def build_app_rows(
                     "application": "",
                     "sys_user": sys_user,
                     "cname": "",
+                    "app_fqdn": "",
+                    "aliases": [],
                     "php_api": "",
                     "php_local": local_php_version(sys_user),
                     "php_effective": local_php_version(sys_user),
@@ -495,6 +521,12 @@ def iter_apps(
             sys_user = str(app.get("sys_user") or app.get("sysUser") or "")
             api_php = app_php_from_api(app)
             local_php = local_php_version(sys_user)
+            aliases = app.get("aliases") or []
+            if isinstance(aliases, str):
+                aliases = [a.strip() for a in aliases.split(",") if a.strip()]
+            elif not isinstance(aliases, list):
+                aliases = []
+            aliases = [str(a).strip() for a in aliases if str(a).strip()]
             rows.append(
                 {
                     "server_id": sid,
@@ -504,8 +536,9 @@ def iter_apps(
                     "label": app.get("label") or app.get("app_label") or sys_user,
                     "application": str(app.get("application", "")),
                     "sys_user": sys_user,
-                    "cname": app.get("cname") or app.get("app_fqdn") or "",
-                    "app_fqdn": app.get("app_fqdn") or "",
+                    "cname": str(app.get("cname") or "").strip(),
+                    "app_fqdn": str(app.get("app_fqdn") or app.get("url") or "").strip(),
+                    "aliases": aliases,
                     "php_api": api_php,
                     "php_local": local_php,
                     "php_effective": local_php or api_php,
@@ -539,20 +572,74 @@ def wait_for_operation(op_id: str, token: str, api_base: str) -> tuple[bool, str
     return False, "timed out waiting for operation"
 
 
+def _normalize_host_candidate(raw: str) -> str:
+    host = str(raw or "").strip()
+    if not host:
+        return ""
+    if "://" in host:
+        host = urlparse(host).hostname or ""
+    host = host.split("/")[0].strip().lower().rstrip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    if not host or "." not in host or " " in host:
+        return ""
+    # Skip placeholder / non-hostname paren text like "(RA WEB)"
+    if not re.fullmatch(r"(?:[a-z0-9-]+\.)+[a-z]{2,}", host):
+        return ""
+    return host
+
+
+def hosts_from_label(label: str) -> list[str]:
+    """Pull domains out of labels like 'Atlantic Foods (atlanticfoods.com)'."""
+    found: list[str] = []
+    text = str(label or "")
+    for m in LABEL_PAREN_DOMAIN_RE.finditer(text):
+        h = _normalize_host_candidate(m.group(1))
+        if h and h not in found:
+            found.append(h)
+    for m in BARE_DOMAIN_RE.finditer(f" {text} "):
+        h = _normalize_host_candidate(m.group(1))
+        if h and h not in found:
+            found.append(h)
+    # Whole label is a bare domain
+    h = _normalize_host_candidate(text)
+    if h and h not in found:
+        found.append(h)
+    return found
+
+
+def app_host_candidates(row: dict) -> list[str]:
+    """Ordered host candidates: custom CNAME/aliases/label, then app_fqdn."""
+    found: list[str] = []
+
+    def add(raw: str, *, allow_cloudwaysapps: bool = True) -> None:
+        h = _normalize_host_candidate(raw)
+        if not h:
+            return
+        if not allow_cloudwaysapps and h.endswith(".cloudwaysapps.com"):
+            return
+        if h not in found:
+            found.append(h)
+
+    add(str(row.get("cname") or ""), allow_cloudwaysapps=False)
+    aliases = row.get("aliases") or []
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    for a in aliases:
+        add(str(a), allow_cloudwaysapps=False)
+    for h in hosts_from_label(str(row.get("label") or "")):
+        add(h, allow_cloudwaysapps=False)
+    # Default platform FQDN last (still better than skipping health check)
+    add(str(row.get("app_fqdn") or ""))
+    # Legacy: some rows stuffed fqdn into cname
+    add(str(row.get("cname") or ""))
+    return found
+
+
 def app_primary_host(row: dict) -> str:
-    """Prefer custom CNAME; fall back to cloudwaysapps FQDN."""
-    for key in ("cname", "app_fqdn", "label"):
-        val = str(row.get(key) or "").strip()
-        if not val:
-            continue
-        # label may be a domain already
-        host = val
-        if "://" in host:
-            host = urlparse(host).hostname or ""
-        host = host.split("/")[0].strip().lower().rstrip(".")
-        if host and "." in host and " " not in host:
-            return host
-    return ""
+    """Prefer custom CNAME/alias/label domain; fall back to cloudwaysapps FQDN."""
+    cands = app_host_candidates(row)
+    return cands[0] if cands else ""
 
 
 def resolve_dns(host: str) -> dict[str, Any]:
@@ -733,7 +820,10 @@ def capture_site_baseline(
         "error": "",
     }
     if not host:
-        result["error"] = "no domain/cname for app"
+        result["error"] = (
+            "no domain/cname for app "
+            "(API cname/aliases/app_fqdn empty and none found in label)"
+        )
         return result
 
     dns = resolve_dns(host)
@@ -1144,14 +1234,18 @@ def main() -> None:
             )
         ok = fail = health_fail = skipped = 0
         for idx, r in enumerate(pending, 1):
+            host_hint = app_primary_host(r) if args.health_check else ""
             print(
                 f"[{idx}/{len(pending)}] server={r['server_id']} app={r['app_id']} "
                 f"{r['label']} {r['php_effective'] or '?'} -> {target}"
+                + (f"  host={host_hint}" if host_hint else "")
             )
             if args.dry_run:
                 if args.health_check:
-                    host = app_primary_host(r)
-                    print(f"    [dry-run] would health-check https://{host or '?'} then upgrade")
+                    print(
+                        f"    [dry-run] would health-check https://{host_hint or '?'} "
+                        f"then upgrade"
+                    )
                 continue
 
             baseline: dict[str, Any] = {}
