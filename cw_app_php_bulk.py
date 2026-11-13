@@ -41,13 +41,19 @@ from __future__ import annotations
 import argparse
 import csv
 import getpass
+import hashlib
 import os
+import random
 import re
+import shutil
+import socket
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -59,9 +65,20 @@ POLL_TIMEOUT = 900
 INPROG_WAIT = 10
 INPROG_MAX = 60
 RATE_SLEEP = 8
+HEALTH_PAGE_COUNT = 3
+HEALTH_FETCH_TIMEOUT = 25
+HEALTH_USER_AGENT = (
+    "Mozilla/5.0 (compatible; CloudwaysPHPHealthCheck/1.0; +https://platform.cloudways.com)"
+)
 
 APPS_ROOT = Path("/home/master/applications")
 APP_FQDN_RE = re.compile(r"[a-zA-Z0-9_]+-(\d+)-(\d+)\.cloudwaysapps\.com")
+TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+HREF_RE = re.compile(r"""href\s*=\s*["']([^"'#]+)["']""", re.I)
+SKIP_HREF_RE = re.compile(
+    r"\.(?:css|js|png|jpe?g|gif|svg|webp|ico|pdf|zip|woff2?|ttf|eot|mp4|mp3)(?:\?|$)",
+    re.I,
+)
 
 _token_cache: dict[str, Any] = {"token": None, "expires_at": None, "api_base": None}
 
@@ -469,6 +486,7 @@ def iter_apps(
         if server_id and sid != str(server_id):
             continue
         s_label = srv.get("label") or srv.get("server_label") or sid
+        public_ip = str(srv.get("public_ip") or srv.get("ip") or "").strip()
         for app in srv.get("apps") or []:
             if not isinstance(app, dict):
                 continue
@@ -481,11 +499,13 @@ def iter_apps(
                 {
                     "server_id": sid,
                     "server_label": s_label,
+                    "server_ip": public_ip,
                     "app_id": str(app.get("id", "")),
                     "label": app.get("label") or app.get("app_label") or sys_user,
                     "application": str(app.get("application", "")),
                     "sys_user": sys_user,
                     "cname": app.get("cname") or app.get("app_fqdn") or "",
+                    "app_fqdn": app.get("app_fqdn") or "",
                     "php_api": api_php,
                     "php_local": local_php,
                     "php_effective": local_php or api_php,
@@ -517,6 +537,304 @@ def wait_for_operation(op_id: str, token: str, api_base: str) -> tuple[bool, str
                 return True, status or message
             return False, status or message or "operation finished with error"
     return False, "timed out waiting for operation"
+
+
+def app_primary_host(row: dict) -> str:
+    """Prefer custom CNAME; fall back to cloudwaysapps FQDN."""
+    for key in ("cname", "app_fqdn", "label"):
+        val = str(row.get(key) or "").strip()
+        if not val:
+            continue
+        # label may be a domain already
+        host = val
+        if "://" in host:
+            host = urlparse(host).hostname or ""
+        host = host.split("/")[0].strip().lower().rstrip(".")
+        if host and "." in host and " " not in host:
+            return host
+    return ""
+
+
+def resolve_dns(host: str) -> dict[str, Any]:
+    """Resolve A/AAAA and best-effort CNAME for host."""
+    info: dict[str, Any] = {"host": host, "cname": "", "a": [], "aaaa": [], "error": ""}
+    if not host:
+        info["error"] = "empty host"
+        return info
+
+    # CNAME via dig/host when available
+    for cmd in (
+        ["dig", "+short", "CNAME", host],
+        ["host", "-t", "CNAME", host],
+    ):
+        if not shutil_which(cmd[0]):
+            continue
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                timeout=8,
+            )
+            out = (proc.stdout or "").strip()
+            if cmd[0] == "dig" and out:
+                info["cname"] = out.splitlines()[0].strip().rstrip(".")
+                break
+            if cmd[0] == "host" and "is an alias for" in out:
+                info["cname"] = out.split("is an alias for")[-1].strip().rstrip(".")
+                break
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+
+    try:
+        for fam, _, _, _, sockaddr in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM):
+            if fam == socket.AF_INET:
+                ip = sockaddr[0]
+                if ip not in info["a"]:
+                    info["a"].append(ip)
+            elif fam == socket.AF_INET6:
+                ip = sockaddr[0]
+                if ip not in info["aaaa"]:
+                    info["aaaa"].append(ip)
+    except socket.gaierror as exc:
+        info["error"] = str(exc)
+    return info
+
+
+def shutil_which(name: str) -> Optional[str]:
+    return shutil.which(name)
+
+
+def normalize_html_for_hash(html: str) -> str:
+    """Strip noisy bits so pre/post hashes stay stable across cache/csrf noise."""
+    text = html or ""
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    text = re.sub(
+        r"<script\b[^>]*>.*?</script>",
+        "",
+        text,
+        flags=re.I | re.S,
+    )
+    text = re.sub(r"<style\b[^>]*>.*?</style>", "", text, flags=re.I | re.S)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip().lower()
+
+
+def extract_title(html: str) -> str:
+    m = TITLE_RE.search(html or "")
+    if not m:
+        return ""
+    return re.sub(r"\s+", " ", m.group(1)).strip()[:200]
+
+
+def fetch_page(url: str) -> dict[str, Any]:
+    """Fetch one URL; return status/title/hash/final_url."""
+    rec: dict[str, Any] = {
+        "url": url,
+        "final_url": "",
+        "status": 0,
+        "title": "",
+        "hash": "",
+        "error": "",
+    }
+    try:
+        resp = requests.get(
+            url,
+            headers={"User-Agent": HEALTH_USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
+            timeout=HEALTH_FETCH_TIMEOUT,
+            allow_redirects=True,
+            verify=True,
+        )
+        rec["status"] = int(resp.status_code)
+        rec["final_url"] = str(resp.url or url)
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        body = resp.text if "html" in ctype or not ctype else ""
+        if not body and resp.content:
+            try:
+                body = resp.content.decode("utf-8", errors="ignore")
+            except Exception:
+                body = ""
+        rec["title"] = extract_title(body)
+        digest = hashlib.sha256(normalize_html_for_hash(body).encode("utf-8", errors="ignore"))
+        rec["hash"] = digest.hexdigest()[:16]
+    except requests.RequestException as exc:
+        rec["error"] = str(exc)[:200]
+    return rec
+
+
+def discover_sample_urls(base_url: str, count: int = HEALTH_PAGE_COUNT) -> list[str]:
+    """Homepage + up to (count-1) random same-host HTML links."""
+    count = max(1, min(int(count), 5))
+    urls = [base_url.rstrip("/") + "/"]
+    home = fetch_page(urls[0])
+    html = ""
+    if not home.get("error") and home.get("status", 0):
+        # Need raw HTML again for links — light second fetch already have title/hash;
+        # re-request body via requests for link discovery only when home worked.
+        try:
+            resp = requests.get(
+                urls[0],
+                headers={"User-Agent": HEALTH_USER_AGENT, "Accept": "text/html"},
+                timeout=HEALTH_FETCH_TIMEOUT,
+                allow_redirects=True,
+            )
+            html = resp.text or ""
+            base_url = str(resp.url or base_url)
+            urls[0] = base_url if base_url.endswith("/") else base_url.rstrip("/") + "/"
+        except requests.RequestException:
+            html = ""
+
+    host = (urlparse(urls[0]).hostname or "").lower()
+    candidates: list[str] = []
+    seen = {urls[0].rstrip("/")}
+    for href in HREF_RE.findall(html):
+        href = href.strip()
+        if not href or href.startswith(("mailto:", "tel:", "javascript:", "data:")):
+            continue
+        if SKIP_HREF_RE.search(href):
+            continue
+        abs_url = urljoin(urls[0], href)
+        parsed = urlparse(abs_url)
+        if parsed.scheme not in ("http", "https"):
+            continue
+        if (parsed.hostname or "").lower() != host:
+            continue
+        clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path or '/'}"
+        if parsed.query:
+            clean += "?" + parsed.query
+        key = clean.rstrip("/")
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(clean)
+
+    random.shuffle(candidates)
+    for u in candidates:
+        if len(urls) >= count:
+            break
+        urls.append(u)
+    return urls[:count]
+
+
+def capture_site_baseline(
+    row: dict,
+    *,
+    page_count: int = HEALTH_PAGE_COUNT,
+    server_ip: str = "",
+) -> dict[str, Any]:
+    """DNS + 2-3 page snapshots before PHP change."""
+    host = app_primary_host(row)
+    result: dict[str, Any] = {
+        "host": host,
+        "dns": {},
+        "pages": [],
+        "ok": False,
+        "error": "",
+    }
+    if not host:
+        result["error"] = "no domain/cname for app"
+        return result
+
+    dns = resolve_dns(host)
+    result["dns"] = dns
+    cname = dns.get("cname") or ""
+    a_recs = dns.get("a") or []
+    print(
+        f"    [health] DNS {host}"
+        + (f" CNAME={cname}" if cname else "")
+        + (f" A={','.join(a_recs[:3])}" if a_recs else "")
+        + (f" err={dns.get('error')}" if dns.get("error") else "")
+    )
+    if server_ip and a_recs and server_ip not in a_recs:
+        print(
+            f"    [health] note: A record {a_recs[0]} != server public_ip {server_ip} "
+            "(CDN/proxy or different IP OK)"
+        )
+
+    base = f"https://{host}"
+    sample_urls = discover_sample_urls(base, count=page_count)
+    pages = [fetch_page(u) for u in sample_urls]
+    result["pages"] = pages
+    ok_pages = [p for p in pages if not p.get("error") and 200 <= int(p.get("status") or 0) < 400]
+    for p in pages:
+        if p.get("error"):
+            print(f"    [health] GET {p['url']} ERR {p['error']}")
+        else:
+            print(
+                f"    [health] GET {p['url']} -> {p['status']} "
+                f"title={p.get('title')!r:.60} hash={p.get('hash')}"
+            )
+    if not ok_pages:
+        result["error"] = "no reachable sample pages before upgrade"
+        return result
+    result["ok"] = True
+    return result
+
+
+def compare_site_snapshots(
+    before: dict[str, Any],
+    after_pages: list[dict[str, Any]],
+    *,
+    soft: bool = False,
+) -> tuple[bool, list[str]]:
+    """
+    Compare pre/post page snapshots.
+    Strict: status + title + content hash.
+    Soft: both reachable (2xx/3xx) + same title.
+    """
+    notes: list[str] = []
+    pre_pages = [p for p in (before.get("pages") or []) if not p.get("error")]
+    if not pre_pages:
+        return False, ["no baseline pages"]
+    by_url = {p.get("url"): p for p in after_pages}
+    matched = 0
+    for pre in pre_pages:
+        url = pre.get("url")
+        post = by_url.get(url)
+        if not post:
+            notes.append(f"missing after fetch for {url}")
+            continue
+        if post.get("error"):
+            notes.append(f"after error {url}: {post['error']}")
+            continue
+        pre_st = int(pre.get("status") or 0)
+        post_st = int(post.get("status") or 0)
+        if soft:
+            if not (200 <= pre_st < 400 and 200 <= post_st < 400):
+                notes.append(f"status class mismatch {url}: {pre_st} -> {post_st}")
+                continue
+            if (pre.get("title") or "") != (post.get("title") or ""):
+                notes.append(
+                    f"title mismatch {url}: {pre.get('title')!r} -> {post.get('title')!r}"
+                )
+                continue
+        else:
+            if pre_st != post_st:
+                notes.append(f"status mismatch {url}: {pre_st} -> {post_st}")
+                continue
+            if (pre.get("title") or "") != (post.get("title") or ""):
+                notes.append(
+                    f"title mismatch {url}: {pre.get('title')!r} -> {post.get('title')!r}"
+                )
+                continue
+            if (pre.get("hash") or "") != (post.get("hash") or ""):
+                notes.append(
+                    f"content hash mismatch {url}: {pre.get('hash')} -> {post.get('hash')}"
+                )
+                continue
+        matched += 1
+        print(
+            f"    [health] OK match {url} status={post_st} "
+            f"title={post.get('title')!r:.50}"
+        )
+    ok = matched == len(pre_pages) and not notes
+    return ok, notes
+
+
+def recheck_site_after(before: dict[str, Any]) -> list[dict[str, Any]]:
+    urls = [p.get("url") for p in (before.get("pages") or []) if p.get("url")]
+    return [fetch_page(u) for u in urls]
 
 
 def post_php_version(
@@ -728,7 +1046,30 @@ def main() -> None:
         action="store_true",
         help="With --apply, stop after the first failed update (useful with --debug)",
     )
+    parser.add_argument(
+        "--no-health-check",
+        action="store_true",
+        help="Disable before/after HTTP page comparison (enabled by default on --apply)",
+    )
+    parser.add_argument(
+        "--health-pages",
+        type=int,
+        default=HEALTH_PAGE_COUNT,
+        metavar="N",
+        help="Number of pages to sample (default: 3, max 5)",
+    )
+    parser.add_argument(
+        "--health-soft",
+        action="store_true",
+        help="Softer compare: require reachable + same <title>, ignore body hash",
+    )
+    parser.add_argument(
+        "--health-allow-unreachable",
+        action="store_true",
+        help="Still upgrade if pre-check cannot reach the site",
+    )
     args = parser.parse_args()
+    args.health_check = not args.no_health_check
 
     if not args.audit and not args.apply:
         args.audit = True
@@ -796,14 +1137,41 @@ def main() -> None:
                 + (f", skip_php={args.skip_php}" if args.skip_php else "")
             )
         print(f"Target PHP {target} — {len(pending)} app(s) to update, {len(rows) - len(pending)} already match.")
-        ok = fail = 0
+        if args.health_check and not args.dry_run:
+            print(
+                f"Health check ON: DNS + {args.health_pages} page(s) before/after "
+                f"({'soft' if args.health_soft else 'strict'} compare)."
+            )
+        ok = fail = health_fail = skipped = 0
         for idx, r in enumerate(pending, 1):
             print(
                 f"[{idx}/{len(pending)}] server={r['server_id']} app={r['app_id']} "
                 f"{r['label']} {r['php_effective'] or '?'} -> {target}"
             )
             if args.dry_run:
+                if args.health_check:
+                    host = app_primary_host(r)
+                    print(f"    [dry-run] would health-check https://{host or '?'} then upgrade")
                 continue
+
+            baseline: dict[str, Any] = {}
+            if args.health_check:
+                baseline = capture_site_baseline(
+                    r,
+                    page_count=args.health_pages,
+                    server_ip=str(r.get("server_ip") or ""),
+                )
+                if not baseline.get("ok"):
+                    print(f"    [health] pre-check failed: {baseline.get('error') or 'unknown'}")
+                    if not args.health_allow_unreachable:
+                        print("    x skip upgrade (site not reachable for baseline)")
+                        skipped += 1
+                        fail += 1
+                        if args.stop_on_fail:
+                            break
+                        continue
+                    print("    [health] continuing anyway (--health-allow-unreachable)")
+
             # Always debug-probe on the first failure so 405 noise is diagnosable
             debug_this = bool(args.debug or fail == 0)
             op_id, err = post_php_version(
@@ -838,9 +1206,35 @@ def main() -> None:
                 print(f"    OK {msg}")
             else:
                 print("    OK (synchronous response)")
+
+            if args.health_check and baseline.get("ok"):
+                # Brief settle time for PHP-FPM/nginx reload after operation
+                time.sleep(3)
+                print("    [health] re-checking sample pages ...")
+                after_pages = recheck_site_after(baseline)
+                aligned, notes = compare_site_snapshots(
+                    baseline, after_pages, soft=args.health_soft,
+                )
+                if aligned:
+                    print("    [health] PASS pre/post pages align")
+                else:
+                    print("    [health] FAIL pre/post pages differ:")
+                    for note in notes[:8]:
+                        print(f"      - {note}")
+                    health_fail += 1
+                    fail += 1
+                    if args.stop_on_fail:
+                        break
+                    time.sleep(RATE_SLEEP)
+                    continue
+
             ok += 1
             time.sleep(RATE_SLEEP)
-        print(f"Done: {ok} updated, {fail} failed, {len(rows) - len(pending)} unchanged.")
+        print(
+            f"Done: {ok} updated+verified, {fail} failed "
+            f"(health mismatches={health_fail}, skipped unreachable={skipped}), "
+            f"{len(rows) - len(pending)} unchanged."
+        )
         if APPS_ROOT.is_dir():
             print("Verify on server: cat /home/master/applications/<sys_user>/.php_version")
             print("Or: cat /etc/ansible/facts.d/applications.fact  # [app_php_version]")
