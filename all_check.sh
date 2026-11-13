@@ -16,6 +16,17 @@
 # servers; raise to 5000-10000 during an active incident so per-minute
 # breakdowns cover a real window.
 N=${1:-1000}
+TODAY=$(date +%d/%b/%Y)
+
+# Emit today's log lines from active + rotated access logs (full day, not tail window).
+today_log_lines() {
+    local log="$1"
+    [ -n "$log" ] || return 0
+    [ -f "$log" ] && grep -F "[$TODAY:" "$log" 2>/dev/null
+    for rot in "$log".[0-9] "$log".[0-9].gz "$log".gz; do
+        [ -f "$rot" ] && zgrep -F "[$TODAY:" "$rot" 2>/dev/null
+    done
+}
 
 echo "=========================================================="
 echo " SERVER SNAPSHOT (right now)"
@@ -80,6 +91,10 @@ for A in $(ls -l /home/master/applications/ | grep "^d" | awk '{print $NF}'); do
 
             echo -e "\n---> Top 5 Server Errors (5xx crashes):"
             tail -n $N "$NGINX_STATUS_LOG" 2>/dev/null | awk '$9 ~ /^50/ {print $9, $7}' | sort | uniq -c | sort -nr | head -n 5
+
+            TODAY_FE_HITS=$(today_log_lines "$NGINX_STATUS_LOG" | wc -l)
+            echo -e "\n---> Top 10 Most Aggressive IPs Today (full nginx access log, $TODAY_FE_HITS hits):"
+            today_log_lines "$NGINX_STATUS_LOG" | awk '{print $1}' | sort | uniq -c | sort -nr | head -n 10
         fi
 
         # ---------------- PHP/BACKEND LOGS (Dynamic Traffic) ---------------- #
@@ -124,6 +139,10 @@ for A in $(ls -l /home/master/applications/ | grep "^d" | awk '{print $NF}'); do
 
             echo -e "\n---> Top 5 Most Aggressive IPs:"
             tail -n $N "$ACCESS_LOG" 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -nr | head -n 5
+
+            TODAY_BE_HITS=$(today_log_lines "$ACCESS_LOG" | wc -l)
+            echo -e "\n---> Top 10 Most Aggressive IPs Today (full backend access log, $TODAY_BE_HITS hits):"
+            today_log_lines "$ACCESS_LOG" | awk '{print $1}' | sort | uniq -c | sort -nr | head -n 10
 
             echo -e "\n---> SWARM CHECK: Top 5 /24 Subnets (hits + rotating IP count within subnet):"
             tail -n $N "$ACCESS_LOG" 2>/dev/null | awk '{split($1,o,"."); sn=o[1]"."o[2]"."o[3]".0/24"; c[sn]++; k=sn SUBSEP $1; if(!s[k]++) u[sn]++} END {for (x in c) printf "%6d hits from %4d IPs ===> %s\n", c[x], u[x], x}' | sort -nr | head -n 5
@@ -198,8 +217,18 @@ echo -e "\n\n=========================================================="
 echo "          GLOBAL AUDIT SUMMARY (ACROSS ALL APPS)          "
 echo "=========================================================="
 
-echo -e "\n---> Top 10 Most Aggressive IPs Across ALL Apps:"
+echo -e "\n---> Top 10 Most Aggressive IPs Across ALL Apps (recent $N lines per log):"
 tail -q -n $N /home/master/applications/*/logs/backend_*.cloudwaysapps.com.access.log 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -nr | head -n 10
+
+echo -e "\n---> Top 10 Most Aggressive IPs Today Across ALL Apps (full backend access logs, $TODAY):"
+for _alog in /home/master/applications/*/logs/backend_*.cloudwaysapps.com.access.log; do
+    [ -f "$_alog" ] && today_log_lines "$_alog"
+done | awk '{print $1}' | sort | uniq -c | sort -nr | head -n 10
+
+echo -e "\n---> Top 10 Most Aggressive IPs Today Across ALL Apps (full nginx access logs, $TODAY):"
+for _nlog in /home/master/applications/*/logs/nginx-app.status.log; do
+    [ -f "$_nlog" ] && today_log_lines "$_nlog"
+done | awk '{print $1}' | sort | uniq -c | sort -nr | head -n 10
 
 echo -e "\n---> GLOBAL SWARM CHECK: Top 10 /24 Subnets Across ALL Apps (hits + IP rotation):"
 tail -q -n $N /home/master/applications/*/logs/backend_*.cloudwaysapps.com.access.log 2>/dev/null | awk '{split($1,o,"."); sn=o[1]"."o[2]"."o[3]".0/24"; c[sn]++; k=sn SUBSEP $1; if(!s[k]++) u[sn]++} END {for (x in c) printf "%6d hits from %4d IPs ===> %s\n", c[x], u[x], x}' | sort -nr | head -n 10
