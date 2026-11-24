@@ -271,27 +271,33 @@ cmd_apply_pools() {
 
   apply_one() {
     local user="$1" maxc="$2"
+    local ver short pool_name pool_file
     ver="$(php_ver_for "$user")"
     [[ -n "$ver" ]] || { echo "SKIP $user (no php version)"; return; }
     pooldir="/etc/php/${ver}/fpm/pool.d"
     [[ -d "$pooldir" ]] || { echo "SKIP $user (no $pooldir)"; return; }
-    # Backup original pool
-    [[ -f "${pooldir}/${user}.conf" ]] && cp -a "${pooldir}/${user}.conf" "$BACKUP_DIR/"
-    override="${pooldir}/z-${user}-limits.conf"
-    cat > "$override" <<EOF
-; Per-app FPM ceiling override for [${user}] — server 110523 ${STAMP}
-[${user}]
-pm = dynamic
-pm.max_children = ${maxc}
-pm.start_servers = 1
-pm.min_spare_servers = 1
-pm.max_spare_servers = 1
-pm.max_requests = 500
-pm.process_idle_timeout = 10s
-request_terminate_timeout = ${REQUEST_TERMINATE_TIMEOUT}
-request_slowlog_timeout = ${REQUEST_SLOWLOG_TIMEOUT}
-EOF
-    echo "OK  $user php${ver}  pm.max_children=${maxc}  -> $override"
+    # Cloudways pool section is sysuser-MAJORMINOR e.g. jwhjhhbyqd-84 (NOT bare sysuser)
+    short="$(echo "$ver" | tr -d '.')"
+    pool_name="${user}-${short}"
+    pool_file="${pooldir}/${pool_name}.conf"
+    [[ -f "$pool_file" ]] || pool_file="$(ls "${pooldir}/${user}"-*.conf 2>/dev/null | head -1)"
+    [[ -n "$pool_file" && -f "$pool_file" ]] || { echo "SKIP $user (no pool conf)"; return; }
+    pool_name="$(basename "$pool_file" .conf)"
+    cp -a "$pool_file" "$BACKUP_DIR/"
+    # Prefer editing the real pool file (avoids incomplete re-declared pools)
+    if grep -qE '^pm\.max_children' "$pool_file"; then
+      sed -i -E "s/^pm\.max_children\s*=.*/pm.max_children = ${maxc}/" "$pool_file"
+    else
+      printf '\npm.max_children = %s\n' "$maxc" >> "$pool_file"
+    fi
+    if grep -qE '^request_terminate_timeout' "$pool_file"; then
+      sed -i -E "s/^request_terminate_timeout\s*=.*/request_terminate_timeout = ${REQUEST_TERMINATE_TIMEOUT}/" "$pool_file"
+    else
+      printf '\nrequest_terminate_timeout = %s\n' "$REQUEST_TERMINATE_TIMEOUT" >> "$pool_file"
+    fi
+    # Remove any broken z- override that redeclared a bare [sysuser] pool
+    rm -f "${pooldir}/z-${user}-limits.conf"
+    echo "OK  $pool_name  pm.max_children=${maxc}  -> $pool_file"
   }
 
   apply_one "$MARMAIS_SYSUSER" "$MARMAIS_MAX_CHILDREN"
