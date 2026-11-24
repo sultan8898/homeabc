@@ -18,12 +18,13 @@
 #   Aggressive cuts (e.g. 40→3/6) WILL cause 502/503 under legitimate traffic —
 #   do NOT ship those. Prefer modest ceiling + IP blocks + nginx probe reject.
 #
-# Suggested ceilings (~25% below current default of 40):
-#   Global / smaller apps:           30   (was 40, −25%)
-#   Marmais (jwhjhhbyqd):            28   (was 40, −30%)
-#   Hope City / Building Blocks:     28
-#   Other high-traffic:              30
-#   Dev / low-traffic:               28
+# Customer-approved ceilings (2026-11-24):
+#   Global / default apps:           30
+#   Marmais (jwhjhhbyqd, 8.4):       28
+#   Hope City (ptrttcfqyk, 8.4):     28
+#   Building Blocks (wyagrxwukc, 8.4): 28
+#   request_terminate_timeout:       60s (global)
+#   Aggregate: systemd MemoryMax on php7.4-fpm / php8.4-fpm (optional backstop)
 #
 # Pair with: AbuseIPDB blocks, nginx vuln-probe 403, request_terminate_timeout,
 # and optional systemd MemoryMax as a backstop (not a substitute for blocking).
