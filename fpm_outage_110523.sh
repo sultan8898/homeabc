@@ -49,11 +49,13 @@ DEV_MAX_CHILDREN="${DEV_MAX_CHILDREN:-28}"
 REQUEST_TERMINATE_TIMEOUT="${REQUEST_TERMINATE_TIMEOUT:-60s}"
 REQUEST_SLOWLOG_TIMEOUT="${REQUEST_SLOWLOG_TIMEOUT:-10s}"
 
-# Confirmed abusive scanners (AbuseIPDB 98–100) seen in 110523 backend samples
+# Confirmed abusive scanners (AbuseIPDB 98–100 + customer-corroborated)
+# 34.34.44.74: customer identified as major Marmais outage contributor (127 hits in sample)
 ABUSE_IPS=(
   216.244.66.227
   35.240.5.212
   34.14.32.225
+  34.34.44.74
   207.175.102.161
   34.77.244.113
   34.78.28.241
