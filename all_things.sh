@@ -251,16 +251,16 @@ grep -rH "^[[:space:]]*pm.max_children" /etc/php/*/fpm/pool.d/ 2>/dev/null | sor
 echo
 ps -eo rss,args 2>/dev/null | awk '/php-fpm: pool/{a[$4]+=$1;n[$4]++} END{for(p in a) printf "%s %d workers %d MB\n",p,n[p],a[p]/1024}' | sort -k4 -nr
 
-# --- 535: Redis Snapshot (if listening) ---
+# --- 535: Redis Snapshot (deep check runs in section 543) ---
 echo -e "\n=========================================================="
-echo " Redis quick status"
+echo " Redis quick status (deep suite in section 543)"
 echo "=========================================================="
 if command -v redis-cli >/dev/null 2>&1 && redis-cli ping 2>/dev/null | grep -q PONG; then
   redis-cli INFO memory 2>/dev/null | grep -E 'used_memory_human|maxmemory_human|mem_fragmentation_ratio'
   redis-cli INFO clients 2>/dev/null | grep -E 'connected_clients|blocked_clients'
   redis-cli INFO stats 2>/dev/null | grep -E 'keyspace_hits|keyspace_misses|evicted_keys|expired_keys'
 else
-  echo "Redis not reachable via redis-cli ping"
+  echo "Unauthenticated redis-cli ping failed (auth may be required; see section 543)"
 fi
 
 # --- 536: SSL Cert Expiry for Domains Pointing Here ---
@@ -500,3 +500,300 @@ echo
 echo "Reading notes: this describes only the ${WINDOW}s window above. If load average is far above what was sampled, the heavy period was earlier and the history, logs and kernel events cover it."
 CPUEOF
 bash /root/cpucheck.sh 60 15 2>&1 | tee /root/cpucheck-$(date -u +%Y%m%dT%H%M%SZ).txt
+
+# --- 543: Redis deep diagnosis (auth discovery + full suite) ---
+echo -e "\n=========================================================="
+echo " Redis deep diagnosis"
+echo "=========================================================="
+
+rcli() { redis-cli --no-auth-warning "$@"; }
+
+discover_redis_auth() {
+  REDIS_HOST="127.0.0.1"
+  REDIS_PORT="6379"
+  REDIS_PASS=""
+  REDIS_USER=""
+  REDIS_AUTH_SRC="none"
+
+  if rcli ping 2>/dev/null | grep -q PONG; then
+    REDIS_AUTH_SRC="nopass"
+    return 0
+  fi
+
+  # requirepass / ACL from redis.conf variants
+  for conf in /etc/redis/redis.conf /etc/redis.conf /etc/redis/redis-server.conf; do
+    [ -f "$conf" ] || continue
+    rp=$(awk '/^[[:space:]]*requirepass[[:space:]]+/ {print $2; exit}' "$conf" | tr -d '"' | tr -d "'")
+    if [ -n "$rp" ]; then
+      if rcli -a "$rp" ping 2>/dev/null | grep -q PONG; then
+        REDIS_PASS="$rp"
+        REDIS_AUTH_SRC="redis.conf:$conf"
+        return 0
+      fi
+    fi
+  done
+
+  # Cloudways / Object Cache Pro: scrape WP_REDIS_CONFIG from wp-config.php
+  while IFS= read -r cfg; do
+    [ -f "$cfg" ] || continue
+    block=$(awk '
+      /WP_REDIS_CONFIG/ {inb=1}
+      inb {print}
+      inb && /\];/ {exit}
+    ' "$cfg" 2>/dev/null)
+    [ -n "$block" ] || continue
+
+    h=$(printf '%s\n' "$block" | grep -oE "'host'[[:space:]]*=>[[:space:]]*'[^']+'" | head -1 | sed -E "s/.*=>[[:space:]]*'([^']+)'.*/\1/")
+    p=$(printf '%s\n' "$block" | grep -oE "'port'[[:space:]]*=>[[:space:]]*[0-9]+" | head -1 | grep -oE '[0-9]+$')
+    pw=$(printf '%s\n' "$block" | grep -oE "'password'[[:space:]]*=>[[:space:]]*'[^']*'" | head -1 | sed -E "s/.*=>[[:space:]]*'([^']*)'.*/\1/")
+    [ -z "$pw" ] && pw=$(printf '%s\n' "$block" | grep -oE '"password"[[:space:]]*=>[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*=>[[:space:]]*"([^"]*)".*/\1/')
+    u=$(printf '%s\n' "$block" | grep -oE "'username'[[:space:]]*=>[[:space:]]*'[^']*'" | head -1 | sed -E "s/.*=>[[:space:]]*'([^']*)'.*/\1/")
+    [ -z "$u" ] && u=$(printf '%s\n' "$block" | grep -oE "'user'[[:space:]]*=>[[:space:]]*'[^']*'" | head -1 | sed -E "s/.*=>[[:space:]]*'([^']*)'.*/\1/")
+
+    # also catch classic defines
+    [ -z "$pw" ] && pw=$(grep -oE "define\(\s*'WP_REDIS_PASSWORD'\s*,\s*'[^']*'" "$cfg" 2>/dev/null | head -1 | sed -E "s/.*,\s*'([^']*)'.*/\1/")
+    [ -z "$h" ] && h=$(grep -oE "define\(\s*'WP_REDIS_HOST'\s*,\s*'[^']*'" "$cfg" 2>/dev/null | head -1 | sed -E "s/.*,\s*'([^']*)'.*/\1/")
+    [ -z "$p" ] && p=$(grep -oE "define\(\s*'WP_REDIS_PORT'\s*,\s*[0-9]+" "$cfg" 2>/dev/null | head -1 | grep -oE '[0-9]+$')
+
+    [ -n "$h" ] && REDIS_HOST="$h"
+    [ -n "$p" ] && REDIS_PORT="$p"
+
+    if [ -n "$pw" ]; then
+      if [ -n "$u" ]; then
+        if rcli -h "$REDIS_HOST" -p "$REDIS_PORT" --user "$u" -a "$pw" ping 2>/dev/null | grep -q PONG; then
+          REDIS_PASS="$pw"; REDIS_USER="$u"; REDIS_AUTH_SRC="wp-config:$cfg"
+          return 0
+        fi
+      fi
+      if rcli -h "$REDIS_HOST" -p "$REDIS_PORT" -a "$pw" ping 2>/dev/null | grep -q PONG; then
+        REDIS_PASS="$pw"; REDIS_AUTH_SRC="wp-config:$cfg"
+        return 0
+      fi
+    fi
+  done < <(find /home/master/applications -maxdepth 4 -type f -name wp-config.php 2>/dev/null)
+
+  return 1
+}
+
+rc() {
+  # authenticated redis-cli wrapper using discovered creds
+  if [ -n "$REDIS_USER" ] && [ -n "$REDIS_PASS" ]; then
+    rcli -h "${REDIS_HOST:-127.0.0.1}" -p "${REDIS_PORT:-6379}" --user "$REDIS_USER" -a "$REDIS_PASS" "$@"
+  elif [ -n "$REDIS_PASS" ]; then
+    rcli -h "${REDIS_HOST:-127.0.0.1}" -p "${REDIS_PORT:-6379}" -a "$REDIS_PASS" "$@"
+  else
+    rcli -h "${REDIS_HOST:-127.0.0.1}" -p "${REDIS_PORT:-6379}" "$@"
+  fi
+}
+
+echo "===== REDIS HOST SNAPSHOT ====="
+uptime
+nproc
+free -m
+vmstat 1 5
+top -b -n1 -o %CPU 2>/dev/null | head -n 25
+ps -eo pid,user,%cpu,%mem,rss,etime,cmd --sort=-%cpu 2>/dev/null | head -n 15
+ps -C redis-server -o pid,user,%cpu,%mem,rss,etime,nlwp,cmd 2>/dev/null
+RPIDS=$(pgrep -d, redis-server 2>/dev/null)
+if [ -n "$RPIDS" ]; then
+  top -b -H -n1 -p "$RPIDS" 2>/dev/null | head -n 20
+  if command -v pidstat >/dev/null 2>&1; then
+    pidstat -u -p "$RPIDS" 1 5 2>/dev/null
+  else
+    echo "pidstat not installed"
+  fi
+fi
+systemctl status redis-server --no-pager 2>/dev/null || systemctl status redis --no-pager 2>/dev/null || true
+dpkg -l 2>/dev/null | grep -i redis || true
+
+echo
+echo "===== REDIS AUTH DISCOVERY ====="
+if discover_redis_auth; then
+  echo "Auth OK via: $REDIS_AUTH_SRC  host=$REDIS_HOST port=$REDIS_PORT user=${REDIS_USER:-default}"
+else
+  echo "Could not authenticate to Redis (tried nopass, redis.conf requirepass, wp-config WP_REDIS_CONFIG)"
+fi
+
+if rc ping 2>/dev/null | grep -q PONG; then
+  echo
+  echo "===== REDIS INFO / CONFIG / SLOWLOG ====="
+  rc INFO server 2>/dev/null | grep -E 'redis_version|uptime_in_seconds|process_id|config_file|hz|io_threads'
+  rc INFO cpu 2>/dev/null
+  rc INFO memory 2>/dev/null | grep -E 'used_memory_human|used_memory_rss_human|used_memory_peak_human|used_memory_startup|maxmemory_human|maxmemory_policy|mem_fragmentation_ratio'
+  rc INFO stats 2>/dev/null | grep -E 'instantaneous_ops_per_sec|total_commands_processed|rejected_connections|evicted_keys|expired_keys|keyspace_hits|keyspace_misses|eviction_exceeded_time'
+  rc INFO clients 2>/dev/null
+  rc INFO persistence 2>/dev/null | grep -E 'loading|rdb_bgsave_in_progress|rdb_last_bgsave_status|aof_enabled|aof_rewrite_in_progress'
+  rc INFO errorstats 2>/dev/null
+  rc INFO commandstats 2>/dev/null | awk -F'[=,]' '/cmdstat/{print $4, $0}' | sort -nr | head -n 15
+  echo "keyspace lines: $(rc INFO keyspace 2>/dev/null | wc -l)"
+  rc INFO keyspace 2>/dev/null | head -n 20
+  rc CONFIG GET maxmemory 2>/dev/null
+  rc CONFIG GET maxmemory-policy 2>/dev/null
+  rc CONFIG GET databases 2>/dev/null
+  rc CONFIG GET hz 2>/dev/null
+  rc CONFIG GET save 2>/dev/null
+  rc CONFIG GET appendonly 2>/dev/null
+  echo "client list count: $(rc CLIENT LIST 2>/dev/null | wc -l)"
+  rc CLIENT LIST 2>/dev/null | grep -o 'cmd=[a-z|]*' | sort | uniq -c | sort -nr | head -n 10
+  echo "slowlog len: $(rc SLOWLOG LEN 2>/dev/null)"
+  rc SLOWLOG GET 20 2>/dev/null
+  rc LATENCY LATEST 2>/dev/null
+  rc LATENCY DOCTOR 2>/dev/null
+  timeout 10 redis-cli --no-auth-warning ${REDIS_PASS:+-a "$REDIS_PASS"} ${REDIS_USER:+--user "$REDIS_USER"} -h "${REDIS_HOST:-127.0.0.1}" -p "${REDIS_PORT:-6379}" --stat 2>/dev/null || true
+  timeout 10 redis-cli --no-auth-warning ${REDIS_PASS:+-a "$REDIS_PASS"} ${REDIS_USER:+--user "$REDIS_USER"} -h "${REDIS_HOST:-127.0.0.1}" -p "${REDIS_PORT:-6379}" --latency 2>/dev/null || true
+
+  echo
+  echo "===== REDIS EXTRA HEALTH FLAGS ====="
+  MEM_FRAG=$(rc INFO memory 2>/dev/null | awk -F: '/mem_fragmentation_ratio/{gsub(/\r/,"",$2); print $2}')
+  MAXMEM=$(rc CONFIG GET maxmemory 2>/dev/null | awk 'NR==2{print}')
+  USEDBYTES=$(rc INFO memory 2>/dev/null | awk -F: '/^used_memory:/{gsub(/\r/,"",$2); print $2}')
+  OPS=$(rc INFO stats 2>/dev/null | awk -F: '/instantaneous_ops_per_sec/{gsub(/\r/,"",$2); print $2}')
+  EVICT=$(rc INFO stats 2>/dev/null | awk -F: '/^evicted_keys:/{gsub(/\r/,"",$2); print $2}')
+  REJECT=$(rc INFO stats 2>/dev/null | awk -F: '/rejected_connections/{gsub(/\r/,"",$2); print $2}')
+  HITS=$(rc INFO stats 2>/dev/null | awk -F: '/keyspace_hits/{gsub(/\r/,"",$2); print $2}')
+  MISSES=$(rc INFO stats 2>/dev/null | awk -F: '/keyspace_misses/{gsub(/\r/,"",$2); print $2}')
+  echo "fragmentation_ratio=$MEM_FRAG ops/s=$OPS evicted_keys=$EVICT rejected_connections=$REJECT used_memory=$USEDBYTES maxmemory=$MAXMEM"
+  awk -v h="$HITS" -v m="$MISSES" 'BEGIN{t=h+m; if(t>0) printf "hit_rate=%.2f%% (%d hits / %d lookups)\n", h*100/t, h, t; else print "hit_rate=n/a"}'
+  awk -v f="$MEM_FRAG" 'BEGIN{if(f+0>0 && (f+0<1.0 || f+0>2.5)) print "FLAG: mem_fragmentation_ratio unusual (" f ")"}'
+  awk -v u="$USEDBYTES" -v m="$MAXMEM" 'BEGIN{if(m+0>0 && u+0>0 && u/m>0.90) printf "FLAG: used_memory is %.1f%% of maxmemory\n", u*100/m}'
+  [ "${EVICT:-0}" -gt 0 ] 2>/dev/null && echo "FLAG: evicted_keys=$EVICT (maxmemory pressure / eviction happening)"
+  [ "${REJECT:-0}" -gt 0 ] 2>/dev/null && echo "FLAG: rejected_connections=$REJECT"
+
+  echo
+  echo "===== PER-APP REDIS DB MAPPING (from wp-config) ====="
+  printf '%-20s %-10s %-8s %-s\n' "APP" "DATABASE" "KEYS" "CONFIG"
+  for cfg in $(find /home/master/applications -maxdepth 4 -type f -name wp-config.php 2>/dev/null); do
+    app=$(echo "$cfg" | awk -F/ '{for(i=1;i<=NF;i++) if($i=="applications"){print $(i+1); exit}}')
+    db=$(awk '/WP_REDIS_CONFIG/{inb=1} inb && /database/{match($0,/[0-9]+/); if(RSTART){print substr($0,RSTART,RLENGTH); exit}} inb && /\];/{exit}' "$cfg" 2>/dev/null)
+    [ -z "$db" ] && continue
+    keys=$(rc -n "$db" DBSIZE 2>/dev/null | awk '{print $NF}')
+    printf '%-20s %-10s %-8s %-s\n' "$app" "$db" "${keys:-?}" "$cfg"
+  done
+
+  echo
+  echo "===== BIGGEST REDIS KEYS (SCAN sample, db0 + mapped dbs) ====="
+  for db in 0 $(for cfg in $(find /home/master/applications -maxdepth 4 -name wp-config.php 2>/dev/null); do awk '/WP_REDIS_CONFIG/{inb=1} inb && /database/{match($0,/[0-9]+/); if(RSTART){print substr($0,RSTART,RLENGTH); exit}} inb && /\];/{exit}' "$cfg"; done | sort -nu | head -10); do
+    echo "-- DB $db sample --"
+    rc -n "$db" --scan --count 200 2>/dev/null | head -n 30 | while read -r k; do
+      [ -z "$k" ] && continue
+      sz=$(rc -n "$db" MEMORY USAGE "$k" 2>/dev/null)
+      echo "${sz:-0} $k"
+    done | sort -nr | head -n 8
+  done
+else
+  echo "Skipping INFO/CONFIG suite: Redis not authenticated"
+fi
+
+echo
+echo "===== REDIS LOGS / OBJECTCACHE / MONIT / SAR ====="
+journalctl -u redis-server --since "-6h" --no-pager 2>/dev/null | tail -n 50
+tail -n 50 /var/log/redis/*.log 2>/dev/null
+grep -iE 'objectcache|OOM command' /var/log/syslog 2>/dev/null | tail -n 20
+grep -i redis /var/log/monit.log 2>/dev/null | tail -n 20
+if command -v sar >/dev/null 2>&1; then
+  sar -u 2>/dev/null | tail -n 30 || echo "sar history unavailable (sysstat data collecting may be disabled)"
+else
+  echo "sar not installed"
+fi
+
+# --- 544: Varnish deep diagnosis ---
+echo -e "\n=========================================================="
+echo " Varnish deep diagnosis"
+echo "=========================================================="
+
+# Prefer a live domain that points to this server; fall back to first non-cloudwaysapps server_name
+SIP_V=$(curl -s --max-time 5 ifconfig.me)
+DOMAIN=""
+for d in /home/master/applications/*/; do
+  f="${d}conf/server.nginx"
+  [ -f "$f" ] || continue
+  for dom in $(grep -hE '^\s*server_name' "$f" | sed 's/server_name//; s/;//' | tr ' ' '\n' | grep -vE '^\s*$|^_$|^\*|^~|cloudwaysapps\.com' | sort -u); do
+    ips=$(dig +short A "$dom" @8.8.8.8 | grep -E '^[0-9.]+$' | tr '\n' ' ')
+    if echo " $ips " | grep -q " $SIP_V "; then
+      DOMAIN="$dom"
+      break 2
+    fi
+  done
+done
+if [ -z "$DOMAIN" ]; then
+  DOMAIN=$(grep -hE '^\s*server_name' /home/master/applications/*/conf/server.nginx 2>/dev/null | sed 's/server_name//; s/;//' | tr ' ' '\n' | grep -vE '^\s*$|^_$|^\*|^~|cloudwaysapps\.com' | head -1)
+fi
+DOMAIN=${DOMAIN:-example.com}
+echo "Using DOMAIN=$DOMAIN for external response tests"
+
+T=/tmp/vchk.$$
+{
+echo "===== 1. VERSION / SERVICE / STORAGE ====="
+varnishd -V 2>&1 | head -1
+systemctl is-active varnish 2>/dev/null
+systemctl show varnish -p ActiveEnterTimestamp 2>/dev/null
+ps -eo pid,etime,args | grep '[v]arnishd' | head -3
+echo; echo "===== 2. VCL / BACKEND / KEY PARAMS ====="
+varnishadm vcl.list 2>&1
+varnishadm backend.list 2>&1
+varnishadm param.show default_ttl 2>&1 | head -3
+varnishadm param.show default_grace 2>&1 | head -3
+varnishadm param.show thread_pool_min 2>&1 | head -2
+varnishadm param.show thread_pool_max 2>&1 | head -2
+
+echo; echo "===== 3. COUNTERS (since varnish start) ====="
+varnishstat -1 -f MAIN.uptime -f MAIN.client_req -f MAIN.cache_hit -f MAIN.cache_miss -f MAIN.cache_hitpass -f MAIN.cache_hitmiss -f MAIN.s_pass -f MAIN.s_synth -f MAIN.n_object -f MAIN.n_expired -f MAIN.n_lru_nuked -f MAIN.backend_fail -f MAIN.backend_busy -f MAIN.sess_dropped -f MAIN.threads_limited -f 'SMA.*.g_bytes' -f 'SMA.*.g_space' 2>&1
+varnishstat -1 2>/dev/null | awk '$1=="MAIN.cache_hit"{h=$2} $1=="MAIN.cache_miss"{m=$2} $1=="MAIN.cache_hitpass"{p=$2} $1=="MAIN.client_req"{r=$2} $1=="MAIN.n_lru_nuked"{n=$2} $1=="MAIN.backend_fail"{bf=$2} $1=="MAIN.threads_limited"{tl=$2} END{printf "hit=%d miss=%d hitpass=%d client_req=%d lru_nuked=%d backend_fail=%d threads_limited=%d | hit%%_of_lookups=%.1f | hit%%_of_all_reqs=%.1f\n",h,m,p,r,n,bf,tl,(h+m+p)?h*100/(h+m+p):0,r?h*100/r:0}'
+
+echo; echo "===== 4. RECENT TRAFFIC BY HANDLING (log buffer window only) ====="
+timeout 60 varnishncsa -d -F '%t' 2>/dev/null | sed -n '1p;$p' | sed 's/^/window edge: /'
+timeout 60 varnishncsa -d -F '%{Varnish:handling}x' 2>/dev/null | sort | uniq -c | sort -rn
+
+echo; echo "===== 5. PURGE ACTIVITY (log buffer window) ====="
+timeout 60 varnishncsa -d -q 'ReqMethod eq "PURGE" or ReqMethod eq "URLPURGE"' -F '%t|%m|%U' > $T.purge 2>/dev/null
+echo "by method:"; cut -d'|' -f2 $T.purge 2>/dev/null | sort | uniq -c
+echo "PURGE method (full domain wipe on Cloudways VCL): $(grep -c '|PURGE|' $T.purge 2>/dev/null || echo 0)"
+echo "window: $(head -1 $T.purge 2>/dev/null | cut -d'|' -f1)  ->  $(tail -1 $T.purge 2>/dev/null | cut -d'|' -f1)"
+echo "busiest minutes:"; cut -d'|' -f1 $T.purge 2>/dev/null | cut -c2-18 | sort | uniq -c | sort -rn | head -8
+echo "top purged URLs:"; cut -d'|' -f2- $T.purge 2>/dev/null | sort | uniq -c | sort -rn | head -15
+
+echo; echo "===== 6. MISS / PASS ANALYSIS (GET, non-static) ====="
+timeout 60 varnishncsa -d -q 'ReqMethod eq "GET"' -F "%{Varnish:handling}x"$'\t'"%U%q"$'\t'"%{Cookie}i" 2>/dev/null \
+ | awk -F'\t' '$2 !~ /\.(css|js|png|jpe?g|gif|webp|svg|woff2?|ico|map)(\?|$)/' > $T.get
+awk -F'\t' '{n[$1]++; t++; q=($2 ~ /\?/); tr=($2 ~ /[?&](utm_[a-z]+|fbclid|gclid|msclkid|ttclid|mc_cid|mc_eid)=/); ck=($3!="-" && $3!=""); wc=($3 ~ /woocommerce_items_in_cart|wp_woocommerce_session|woocommerce_cart_hash|wordpress_logged_in/); if(q)nq[$1]++; if(tr)ntr[$1]++; if(ck)nck[$1]++; if(wc)nwc[$1]++}
+END{printf "%-8s %8s %10s %10s %10s %10s\n","handling","count","with_qs","w/tracking","w/cookie","w/woo_login"; for(k in n)printf "%-8s %8d %10d %10d %10d %10d\n",k,n[k],nq[k],ntr[k],nck[k],nwc[k]; print "total non-static GET:",t}' $T.get
+echo "top MISS URLs:"; awk -F'\t' '$1=="miss"{print $2}' $T.get | sort | uniq -c | sort -rn | head -15
+echo "top PASS URLs:"; awk -F'\t' '$1=="pass"{print $2}' $T.get | sort | uniq -c | sort -rn | head -15
+
+echo; echo "===== 7. CUSTOM VCL FILES ON SERVER ====="
+for f in $(find /home -maxdepth 4 -type f \( -name custom-recv.vcl -o -name custom-resp.vcl \) -size +0 2>/dev/null); do echo "--- $f"; head -40 "$f"; done
+
+echo; echo "===== 8. BREEZE SETTINGS (all apps) ====="
+for f in $(find /home -maxdepth 7 -path '*wp-content/breeze-config/breeze-config.php' 2>/dev/null); do echo "--- $f"; grep -E "auto-purge-varnish|breeze-b-ttl|breeze-mobile-separate|breeze-cache-warmup-enabled|woocommerce_geolocation_ajax" "$f"; grep -A3 "cached-query-strings" "$f" | head -4; done
+
+echo; echo "===== 9. EXTERNAL RESPONSE TEST: $DOMAIN ====="
+H='^(HTTP|server|x-cache|x-varnish|age|cache-control|set-cookie|vary|via|cf-cache-status|x-cache-status)'
+for U in "https://$DOMAIN/" "https://$DOMAIN/" "https://$DOMAIN/?utm_source=chk&fbclid=chk123"; do echo "--- GET $U"; curl -sI -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' --max-time 15 "$U" | grep -iE "$H"; done
+
+echo; echo "===== 10. EXTRA VARNISH HEALTH FLAGS ====="
+varnishstat -1 2>/dev/null | awk '
+  $1=="MAIN.cache_hit"{h=$2}
+  $1=="MAIN.cache_miss"{m=$2}
+  $1=="MAIN.n_lru_nuked"{n=$2}
+  $1=="MAIN.backend_fail"{bf=$2}
+  $1=="MAIN.backend_busy"{bb=$2}
+  $1=="MAIN.threads_limited"{tl=$2}
+  $1=="MAIN.sess_dropped"{sd=$2}
+  $1=="MAIN.client_req"{r=$2}
+  END{
+    lookups=h+m
+    if(lookups>0 && h*100/lookups < 50) printf "FLAG: hit rate of lookups is low (%.1f%%)\n", h*100/lookups
+    if(n+0>0) printf "FLAG: LRU nuked objects=%d (storage pressure / undersized cache)\n", n
+    if(bf+0>0) printf "FLAG: backend_fail=%d\n", bf
+    if(bb+0>0) printf "FLAG: backend_busy=%d\n", bb
+    if(tl+0>0) printf "FLAG: threads_limited=%d\n", tl
+    if(sd+0>0) printf "FLAG: sess_dropped=%d\n", sd
+    if(r+0==0) print "FLAG: no client_req counted yet"
+  }'
+echo "Varnish listen sockets:"
+ss -lntp 2>/dev/null | grep -i varnish || ss -lntp 2>/dev/null | grep -E ':(80|6081|8080)\s'
+echo "Recent varnish syslog:"
+journalctl -u varnish --since "-6h" --no-pager 2>/dev/null | tail -n 30
+grep -i varnish /var/log/syslog 2>/dev/null | tail -n 20
+} 2>&1 | tee /tmp/varnish_check_$(date +%F_%H%M).txt
+rm -f $T.purge $T.get
