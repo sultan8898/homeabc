@@ -5,26 +5,28 @@
 # Run as root on the server. Sections are labeled; copy/paste a section or:
 #   bash fpm_outage_110523.sh discover
 #   bash fpm_outage_110523.sh recover
+#   bash fpm_outage_110523.sh block-abuse
 #   bash fpm_outage_110523.sh apply-global
 #   bash fpm_outage_110523.sh apply-pools
 #   bash fpm_outage_110523.sh nginx-probes
 #   bash fpm_outage_110523.sh verify
 #   bash fpm_outage_110523.sh cf-bypass
 #
-# Memory budget (8 GiB / 4 cores) — effective targets used below:
-#   Reserve ~3.0–3.5 GiB for MariaDB + Redis + Nginx + Apache + OS/security
-#   PHP-FPM budget ~4.0–4.5 GiB
+# Memory budget (8 GiB / 4 cores) — customer-safe targets (~20–30% below default 40):
 #   Observed Marmais: 40 workers ≈ 6.4 GiB RSS (~160 MiB/worker incl. shared)
-#   Probe WordPress 404s: ~234 MiB/request → treat worst-case ~180–200 MiB/worker
-#   Safe aggregate SUM(pm.max_children) ≈ 28–32 across ALL pools/PHP versions
+#   Probe WordPress 404s: ~234 MiB/request
+#   Aggressive cuts (e.g. 40→3/6) WILL cause 502/503 under legitimate traffic —
+#   do NOT ship those. Prefer modest ceiling + IP blocks + nginx probe reject.
 #
-# Suggested ceilings (override after discover maps domains → sys_user):
-#   Marmais (jwhjhhbyqd):     6   (was 40; request suggested 8 — use 6 on 8G)
-#   Hope City:                6
-#   Building Blocks:          5
-#   Other high-traffic:       4
-#   Smaller apps:             3   (new global default)
-#   Dev / disabled-state:     2
+# Suggested ceilings (~25% below current default of 40):
+#   Global / smaller apps:           30   (was 40, −25%)
+#   Marmais (jwhjhhbyqd):            28   (was 40, −30%)
+#   Hope City / Building Blocks:     28
+#   Other high-traffic:              30
+#   Dev / low-traffic:               28
+#
+# Pair with: AbuseIPDB blocks, nginx vuln-probe 403, request_terminate_timeout,
+# and optional systemd MemoryMax as a backstop (not a substitute for blocking).
 #
 # NOTE: Cloudways Platform "PHP Settings" API rejects pm.* (HTTP 422 reserved).
 # Use PHP-FPM Settings (MCP app_fpm_settings_update) OR root edits below.
@@ -39,12 +41,29 @@ GLOBAL_FPM_EXTRAS="/etc/php.confs/fpm/extras/cw_customization.conf"
 STAMP="$(date +%Y%m%d%H%M%S)"
 BACKUP_DIR="/root/fpm_outage_backup_${STAMP}"
 
-# Aggregate-safe defaults (edit after discover)
-DEFAULT_MAX_CHILDREN=3
-MARMAIS_MAX_CHILDREN=6
-HIGH_TRAFFIC_MAX_CHILDREN=4
-REQUEST_TERMINATE_TIMEOUT="60s"
-REQUEST_SLOWLOG_TIMEOUT="10s"
+# Customer-safe defaults: ~20–30% below stock 40 (NOT aggressive 3/6)
+DEFAULT_MAX_CHILDREN="${DEFAULT_MAX_CHILDREN:-30}"
+MARMAIS_MAX_CHILDREN="${MARMAIS_MAX_CHILDREN:-28}"
+HIGH_TRAFFIC_MAX_CHILDREN="${HIGH_TRAFFIC_MAX_CHILDREN:-28}"
+DEV_MAX_CHILDREN="${DEV_MAX_CHILDREN:-28}"
+REQUEST_TERMINATE_TIMEOUT="${REQUEST_TERMINATE_TIMEOUT:-60s}"
+REQUEST_SLOWLOG_TIMEOUT="${REQUEST_SLOWLOG_TIMEOUT:-10s}"
+
+# Confirmed abusive scanners (AbuseIPDB 98–100) seen in 110523 backend samples
+ABUSE_IPS=(
+  216.244.66.227
+  35.240.5.212
+  34.14.32.225
+  207.175.102.161
+  34.77.244.113
+  34.78.28.241
+  34.14.118.80
+  193.37.32.40
+  194.5.82.9
+  194.5.82.43
+  129.146.50.223
+  32.195.61.205
+)
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 need_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "run as root"; }
@@ -276,19 +295,19 @@ EOF
 
   for u in $high; do
     [[ "$u" == "$MARMAIS_SYSUSER" ]] && continue
-    apply_one "$u" 6
-  done
-  for u in $mid; do
     apply_one "$u" "$HIGH_TRAFFIC_MAX_CHILDREN"
   done
+  for u in $mid; do
+    apply_one "$u" "$DEFAULT_MAX_CHILDREN"
+  done
   for u in $dev; do
-    apply_one "$u" 2
+    apply_one "$u" "$DEV_MAX_CHILDREN"
   done
 
   echo
   echo "-- Aggregate check (override files + defaults) --"
   echo "After reload, run: bash $0 verify"
-  echo "Target: SUM(pm.max_children) <= 32 on this 8 GiB host."
+  echo "Ceilings are ~20–30% below 40. Pair with: bash $0 block-abuse"
 
   local svc bin
   for svc in php7.4-fpm php8.4-fpm; do
@@ -306,8 +325,9 @@ EOF
 }
 
 # -----------------------------------------------------------------------------
-# Soft aggregate ceiling: systemd MemoryMax on php*-fpm units (~4.2 GiB total)
-# More apps run 8.4 than 7.4 on this host — weight the budgets accordingly.
+# Soft aggregate ceiling: systemd MemoryMax on php*-fpm units.
+# Optional backstop only — with max_children≈28–30 this is a safety net, not
+# the primary control. Leave headroom for MariaDB (~1.5–2G) + Redis (~250–800M).
 cmd_apply_cgroup() {
   need_root
   local ver unit drop max high
@@ -317,13 +337,13 @@ cmd_apply_cgroup() {
     drop="/etc/systemd/system/${unit}.service.d"
     mkdir -p "$drop"
     if [[ "$ver" == "8.4" ]]; then
-      max="3000M"; high="2700M"
+      max="4500M"; high="4000M"
     else
-      max="1200M"; high="1000M"
+      max="1800M"; high="1600M"
     fi
     cat > "${drop}/memory-ceiling.conf" <<EOF
 [Service]
-# Keep PHP-FPM from exhausting the host; leave headroom for MariaDB/Redis/OS.
+# Soft backstop so FPM cannot eat the whole host under scanner storms.
 MemoryAccounting=yes
 MemoryMax=${max}
 MemoryHigh=${high}
@@ -334,7 +354,59 @@ EOF
   for ver in 7.4 8.4; do
     systemctl try-restart "php${ver}-fpm" 2>/dev/null || true
   done
-  echo "Aggregate FPM cgroup budget ≈ 4200M across PHP 7.4+8.4 (host has 8 GiB)."
+  echo "FPM cgroup backstop ≈ 6300M across PHP 7.4+8.4 (still leaves ~1.5G+ for DB/OS)."
+}
+
+# -----------------------------------------------------------------------------
+# Block confirmed abusive IPs (CSF if present, else ipset/iptables + nginx map)
+cmd_block_abuse() {
+  need_root
+  mkdir -p "$BACKUP_DIR"
+  local ip ngmap="/etc/nginx/conf.d/01-abuse-ip-deny.conf"
+
+  echo "=== BLOCK ABUSE IPS $(date -u) ==="
+  if command -v csf >/dev/null 2>&1; then
+    for ip in "${ABUSE_IPS[@]}"; do
+      csf -d "$ip" "110523 AbuseIPDB/scanner $(date +%F)" || true
+      echo "CSF deny $ip"
+    done
+  else
+    echo "CSF not found — writing nginx deny map (and optional iptables notes)"
+  fi
+
+  {
+    echo "# AbuseIPDB 98–100 scanners observed on 110523 — ${STAMP}"
+    echo "geo \$cw_abuse_ip {"
+    echo "    default 0;"
+    for ip in "${ABUSE_IPS[@]}"; do
+      echo "    ${ip} 1;"
+    done
+    echo "}"
+  } > "$ngmap"
+
+  local u custom
+  for u in $(list_sysusers); do
+    custom="/home/master/applications/${u}/conf/nginx.custom"
+    mkdir -p "$(dirname "$custom")"
+    [[ -f "$custom" ]] && cp -a "$custom" "$BACKUP_DIR/nginx.custom.${u}.pre-abuse" 2>/dev/null || true
+    if [[ -f "$custom" ]] && grep -q 'cw_abuse_ip' "$custom" 2>/dev/null; then
+      echo "OK  $u already has cw_abuse_ip rule"
+      continue
+    fi
+    cat >> "$custom" <<'EOF'
+
+# Deny known abusive scanners (server 110523)
+if ($cw_abuse_ip) { return 403; }
+EOF
+    chown master:master "$custom" 2>/dev/null || true
+    echo "OK  abuse deny -> $custom"
+  done
+
+  nginx -t && systemctl reload nginx
+  echo
+  echo "Blocked / mapped IPs:"
+  printf '  %s\n' "${ABUSE_IPS[@]}"
+  echo "Do NOT block 178.62.1.140 (server self / Wordfence sync) or 127.0.0.1."
 }
 
 # -----------------------------------------------------------------------------
@@ -462,7 +534,7 @@ cmd_verify() {
 
 usage() {
   sed -n '2,35p' "$0"
-  echo "Commands: discover | recover | apply-global | apply-pools | apply-cgroup | nginx-probes | cf-bypass | verify"
+  echo "Commands: discover | recover | block-abuse | apply-global | apply-pools | apply-cgroup | nginx-probes | cf-bypass | verify"
 }
 
 main() {
@@ -470,6 +542,7 @@ main() {
   case "$cmd" in
     discover)      cmd_discover ;;
     recover)       cmd_recover ;;
+    block-abuse)   cmd_block_abuse ;;
     apply-global)  cmd_apply_global ;;
     apply-pools)   cmd_apply_pools ;;
     apply-cgroup)  cmd_apply_cgroup ;;
