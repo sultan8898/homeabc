@@ -797,3 +797,257 @@ journalctl -u varnish --since "-6h" --no-pager 2>/dev/null | tail -n 30
 grep -i varnish /var/log/syslog 2>/dev/null | tail -n 20
 } 2>&1 | tee /tmp/varnish_check_$(date +%F_%H%M).txt
 rm -f $T.purge $T.get
+
+# --- 545: Hybrid stack deep checks (nginx / apache / php / mysql / redis / varnish) ---
+echo -e "\n=========================================================="
+echo " Hybrid stack deep checks (nginx/apache/php/mysql/redis/varnish)"
+echo "=========================================================="
+
+echo "===== A. APPLICATION FACTS / STACK DECLARATION ====="
+if [ -f /etc/ansible/facts.d/applications.fact ]; then
+  cat /etc/ansible/facts.d/applications.fact
+else
+  echo "applications.fact not found"
+fi
+echo
+echo "Listeners (port -> process):"
+ss -lntp 2>/dev/null | awk 'NR==1 || /:(80|443|8080|8081|8082|8085|6081|6379|3306)\s/'
+echo
+echo "Process presence:"
+for p in nginx apache2 httpd varnishd redis-server mariadbd mysqld php-fpm; do
+  c=$(pgrep -c "$p" 2>/dev/null || echo 0)
+  printf '  %-14s %s\n' "$p" "$c"
+done
+
+echo
+echo "===== B. NGINX ====="
+nginx -t 2>&1 | tail -n 5
+nginx -V 2>&1 | tr ' ' '\n' | grep -E 'nginx/|http_v2|http_ssl|with-http' | head -20
+systemctl is-active nginx 2>/dev/null
+echo "worker_processes / connections:"
+grep -rE '^\s*(worker_processes|worker_connections|keepalive_timeout|client_max_body_size|proxy_read_timeout|fastcgi_read_timeout)' /etc/nginx/ 2>/dev/null | grep -vE 'modules|sites-enabled' | head -40
+echo "top nginx error patterns (all apps, last 500 lines each):"
+for f in /home/master/applications/*/logs/nginx-app.error.log; do
+  [ -f "$f" ] || continue
+  app=$(echo "$f" | awk -F/ '{print $(NF-2)}')
+  hits=$(tail -n 500 "$f" 2>/dev/null | grep -ciE 'upstream timed out|connect\(\) failed|no live upstreams|recv\(\) failed|FastCGI|Primary script unknown' || true)
+  [ "${hits:-0}" -eq 0 ] && continue
+  echo "--- $app ($hits) ---"
+  tail -n 500 "$f" 2>/dev/null | grep -iE 'upstream timed out|connect\(\) failed|no live upstreams|recv\(\) failed|FastCGI|Primary script unknown' | sed 's/[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+/x.x.x.x/g' | sort | uniq -c | sort -nr | head -8
+done
+echo "status code mix (nginx-app.status.log, last 2000/app):"
+for f in /home/master/applications/*/logs/nginx-app.status.log; do
+  [ -f "$f" ] || continue
+  app=$(echo "$f" | awk -F/ '{print $(NF-2)}')
+  echo -n "$app: "
+  tail -n 2000 "$f" 2>/dev/null | awk '{print $9}' | grep -E '^[0-9]{3}$' | sort | uniq -c | sort -nr | tr '\n' ' '
+  echo
+done
+echo "uncacheable Woo/AJAX pressure (backend access, last 3000/app):"
+for d in /home/master/applications/*/; do
+  app=$(basename "$d")
+  blog=$(ls "$d"logs/backend_*.access.log 2>/dev/null | head -1)
+  [ -f "$blog" ] || continue
+  echo "--- $app ---"
+  tail -n 3000 "$blog" 2>/dev/null | awk '{print $7}' | cut -d? -f1 | grep -E 'admin-ajax|wc-ajax|wp-cron|wp-json|checkout|cart' | sort | uniq -c | sort -nr | head -12
+  echo -n "wc-ajax actions: "
+  tail -n 3000 "$blog" 2>/dev/null | grep -oE 'wc-ajax=[^& ]+' | sort | uniq -c | sort -nr | head -8 | tr '\n' ' '
+  echo
+  echo -n "admin-ajax actions: "
+  tail -n 3000 "$blog" 2>/dev/null | grep 'admin-ajax.php' | grep -oE 'action=[^& ]+' | sort | uniq -c | sort -nr | head -10 | tr '\n' ' '
+  echo
+done
+
+echo
+echo "===== C. APACHE (hybrid backends) ====="
+apache2ctl -v 2>/dev/null | head -2 || httpd -v 2>/dev/null | head -2
+systemctl is-active apache2 2>/dev/null || systemctl is-active httpd 2>/dev/null
+apache2ctl -S 2>/dev/null | head -40 || true
+echo "mpm / server limits:"
+apache2ctl -M 2>/dev/null | grep -iE 'mpm|proxy|fcgi|http2' || true
+grep -rE '^\s*(MaxRequestWorkers|ServerLimit|ThreadsPerChild|MaxClients|KeepAliveTimeout|Timeout|ProxyTimeout)' /etc/apache2/ 2>/dev/null | head -30
+echo "apache error highlights:"
+for f in /home/master/applications/*/logs/apache_*.error.log /var/log/apache2/*error*.log; do
+  [ -f "$f" ] || continue
+  echo "--- $f ---"
+  tail -n 300 "$f" 2>/dev/null | grep -iE 'timeout|proxy_fcgi|AH0|server reached|MaxRequestWorkers|segfault|oom' | tail -n 12
+done
+echo "apache scoreboard / busy workers (if server-status enabled locally):"
+curl -s --max-time 3 http://127.0.0.1:8081/server-status?auto 2>/dev/null | grep -E '^(BusyWorkers|IdleWorkers|Scoreboard|ReqPerSec|BytesPerSec)' || echo "server-status not available on :8081"
+
+echo
+echo "===== D. PHP-FPM ====="
+echo "installed PHP versions / masters:"
+ps -eo pid,etime,cmd 2>/dev/null | grep 'php-fpm: master' | grep -v grep
+echo
+for conf in /etc/php/*/fpm/pool.d/*.conf; do
+  [ -f "$conf" ] || continue
+  pool=$(basename "$conf" .conf)
+  [ "$pool" = "www" ] || [ "$pool" = "cloudways" ] || [[ "$pool" == placeholder* ]] || [[ "$pool" == *-* ]] || continue
+  echo "--- $conf ---"
+  grep -E '^\s*(\[|user|group|listen|pm\.|request_terminate_timeout|slowlog|request_slowlog_timeout)' "$conf" 2>/dev/null | head -30
+done
+echo
+echo "max_children warnings (all php fpm logs):"
+grep -h 'max_children' /var/log/php*-fpm.log /var/log/php*/*fpm*.log /home/master/applications/*/logs/php-app.error.log 2>/dev/null | tail -n 30
+echo
+echo "slow-log hot plugins/scripts (tail 2000 per app):"
+for f in /home/master/applications/*/logs/php-app.slow.log; do
+  [ -f "$f" ] || continue
+  app=$(echo "$f" | awk -F/ '{print $(NF-2)}')
+  echo "--- $app ---"
+  echo "entry scripts:"
+  grep -E 'script_filename|^\[' "$f" 2>/dev/null | tail -n 2000 | grep script_filename | sed 's/.*script_filename = //' | sort | uniq -c | sort -nr | head -8
+  echo "plugin/theme frames:"
+  tail -n 2000 "$f" 2>/dev/null | grep -oE 'wp-content/(plugins|themes)/[^/]+' | sort | uniq -c | sort -nr | head -10
+  echo "blocking calls:"
+  tail -n 2000 "$f" 2>/dev/null | grep -oE '(sleep|curl_exec|mysqli_query|PDOStatement::execute|file_get_contents|wp_remote_)\(' | sort | uniq -c | sort -nr | head -10
+done
+echo
+echo "OPcache / runtime per live pool socket (best effort):"
+for sock in /var/run/fpm-*.sock /run/php/php*-fpm.sock; do
+  [ -S "$sock" ] || continue
+  echo "socket $sock present"
+done
+php -v 2>/dev/null | head -2
+php -i 2>/dev/null | grep -E '^(memory_limit|max_execution_time|opcache\.(memory_consumption|revalidate_freq|enable)|realpath_cache_size)' | head -20
+
+echo
+echo "===== E. MYSQL / MARIADB ====="
+systemctl is-active mysql 2>/dev/null || systemctl is-active mariadb 2>/dev/null
+mysql --connect-timeout=3 -e "
+SHOW GLOBAL STATUS WHERE Variable_name IN (
+  'Threads_running','Threads_connected','Max_used_connections','Slow_queries',
+  'Created_tmp_tables','Created_tmp_disk_tables','Aborted_connects','Questions',
+  'Innodb_buffer_pool_reads','Innodb_buffer_pool_read_requests','Innodb_row_lock_waits'
+);
+SHOW GLOBAL VARIABLES WHERE Variable_name IN (
+  'innodb_buffer_pool_size','tmp_table_size','max_heap_table_size','max_connections',
+  'table_open_cache','innodb_io_capacity','slow_query_log','long_query_time'
+);
+" 2>/dev/null
+echo
+echo "tmp table disk ratio:"
+mysql --connect-timeout=3 -N -e "
+SELECT CONCAT('tmp_disk_ratio=',
+  IFNULL(ROUND(100*dds/NULLIF(tots,0),2),0),'% (',dds,'/',tots,')')
+FROM (
+  SELECT
+    MAX(CASE WHEN Variable_name='Created_tmp_disk_tables' THEN Variable_value END)+0 dds,
+    MAX(CASE WHEN Variable_name='Created_tmp_tables' THEN Variable_value END)+0 tots
+  FROM performance_schema.global_status
+  WHERE Variable_name IN ('Created_tmp_disk_tables','Created_tmp_tables')
+) x;
+" 2>/dev/null || true
+echo
+echo "largest tables across app DBs:"
+mysql --connect-timeout=3 -e "
+SELECT table_schema, table_name,
+  ROUND((data_length+index_length)/1024/1024) AS mb,
+  table_rows
+FROM information_schema.tables
+WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys')
+ORDER BY (data_length+index_length) DESC LIMIT 20;
+" 2>/dev/null
+echo
+echo "active non-sleep processlist:"
+mysql --connect-timeout=3 -e "
+SELECT ID,USER,DB,TIME,STATE,LEFT(INFO,120) q
+FROM information_schema.processlist
+WHERE COMMAND<>'Sleep' AND ID<>CONNECTION_ID()
+ORDER BY TIME DESC LIMIT 15;
+" 2>/dev/null
+echo
+echo "slow query log tail patterns:"
+for f in /var/log/mysql/slow-query.log /var/log/mysql/mariadb-slow.log /var/lib/mysql/*-slow.log; do
+  [ -f "$f" ] || continue
+  echo "--- $f ---"
+  tail -n 200 "$f" 2>/dev/null | grep -E '^# Query_time|SELECT|UPDATE|INSERT' | tail -n 40
+done
+
+echo
+echo "===== F. REDIS QUICK RECHECK ====="
+if command -v redis-cli >/dev/null 2>&1; then
+  if type rc >/dev/null 2>&1 && rc ping 2>/dev/null | grep -q PONG; then
+    rc INFO memory 2>/dev/null | grep -E 'used_memory_human|maxmemory_human|mem_fragmentation_ratio|evicted_keys'
+    rc INFO stats 2>/dev/null | grep -E 'instantaneous_ops_per_sec|keyspace_hits|keyspace_misses|rejected_connections'
+    rc SLOWLOG LEN 2>/dev/null
+  elif redis-cli ping 2>/dev/null | grep -q PONG; then
+    redis-cli INFO memory 2>/dev/null | grep -E 'used_memory_human|maxmemory_human|mem_fragmentation_ratio'
+  else
+    echo "Redis auth needed; see section 543"
+  fi
+fi
+grep -iE 'objectcache|OOM command|WRONGPASS|NOAUTH' /var/log/syslog 2>/dev/null | tail -n 15
+
+echo
+echo "===== G. VARNISH QUICK RECHECK ====="
+if pgrep -x varnishd >/dev/null 2>&1; then
+  varnishstat -1 2>/dev/null | awk '
+    $1=="MAIN.cache_hit"{h=$2}
+    $1=="MAIN.cache_miss"{m=$2}
+    $1=="MAIN.cache_hitpass"{p=$2}
+    $1=="MAIN.n_lru_nuked"{n=$2}
+    $1=="MAIN.backend_fail"{bf=$2}
+    $1=="MAIN.client_req"{r=$2}
+    END{
+      lookups=h+m+p
+      printf "hit=%d miss=%d hitpass=%d req=%d lru_nuked=%d backend_fail=%d hit%%_lookups=%.1f hit%%_req=%.1f\n",
+        h,m,p,r,n,bf,lookups?h*100/lookups:0,r?h*100/r:0
+    }'
+  varnishadm backend.list 2>/dev/null | head -20
+else
+  echo "varnishd not running"
+fi
+
+echo
+echo "===== H. BOT / ABUSE SIGNAL SWEEP ====="
+echo "spoofed/high Chrome majors + known scrapers (nginx status last 5000/app):"
+for f in /home/master/applications/*/logs/nginx-app.status.log; do
+  [ -f "$f" ] || continue
+  app=$(echo "$f" | awk -F/ '{print $(NF-2)}')
+  echo "--- $app ---"
+  tail -n 5000 "$f" 2>/dev/null | grep -oE 'Chrome/[0-9]+' | sort | uniq -c | sort -nr | head -8
+  tail -n 5000 "$f" 2>/dev/null | grep -oiE 'ShapBot|ClearstromBot|RiverBot|ComponentsFinder|Bytespider|GPTBot|petalsearch|HeadlessChrome' | sort | uniq -c | sort -nr | head -10
+done
+echo
+echo "top IPs last 5000 backend hits + AbuseIPDB hint list (manual follow-up):"
+for d in /home/master/applications/*/; do
+  app=$(basename "$d")
+  blog=$(ls "$d"logs/backend_*.access.log 2>/dev/null | head -1)
+  [ -f "$blog" ] || continue
+  echo "--- $app ---"
+  tail -n 5000 "$blog" 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -nr | head -15
+done
+
+echo
+echo "===== I. STACK HEALTH FLAGS ====="
+# PHP pool saturation
+MCALL=$(grep -h 'server reached pm.max_children' /var/log/php*-fpm.log /var/log/php*/*fpm*.log 2>/dev/null | wc -l)
+[ "${MCALL:-0}" -gt 0 ] && echo "FLAG: php-fpm max_children warnings total=$MCALL"
+# Swap
+SWAPUSED=$(free -m | awk '/Swap/{print $3}')
+[ "${SWAPUSED:-0}" -gt 256 ] && echo "FLAG: swap in use ${SWAPUSED} MB"
+# Disk tmp tables
+mysql --connect-timeout=3 -N -e "
+SELECT IF(dds/NULLIF(tots,0)>0.25,
+  CONCAT('FLAG: tmp tables on disk ratio ',ROUND(100*dds/tots,1),'%'),
+  NULL)
+FROM (
+  SELECT
+    MAX(CASE WHEN Variable_name='Created_tmp_disk_tables' THEN Variable_value END)+0 dds,
+    MAX(CASE WHEN Variable_name='Created_tmp_tables' THEN Variable_value END)+0 tots
+  FROM performance_schema.global_status
+  WHERE Variable_name IN ('Created_tmp_disk_tables','Created_tmp_tables')
+) x;
+" 2>/dev/null
+# Woo ajax dominance
+for d in /home/master/applications/*/; do
+  blog=$(ls "$d"logs/backend_*.access.log 2>/dev/null | head -1)
+  [ -f "$blog" ] || continue
+  app=$(basename "$d")
+  tot=$(tail -n 3000 "$blog" 2>/dev/null | wc -l)
+  ajax=$(tail -n 3000 "$blog" 2>/dev/null | grep -cE 'admin-ajax|wc-ajax')
+  awk -v a="$ajax" -v t="$tot" -v app="$app" 'BEGIN{if(t>0 && a/t>0.25) printf "FLAG: %s ajax/wc-ajax is %.0f%% of last %d backend hits\n",app,a*100/t,t}'
+done
+echo "Stack deep checks complete."
