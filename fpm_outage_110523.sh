@@ -360,24 +360,55 @@ EOF
 }
 
 # -----------------------------------------------------------------------------
-# Block confirmed abusive IPs (CSF if present, else ipset/iptables + nginx map)
+# Block confirmed abusive IPs.
+# Cloudways Flexible often has NO csf — use nginx geo + iptables/ipset,
+# and Imunify360 blacklist if imunify360-agent is present.
 cmd_block_abuse() {
   need_root
   mkdir -p "$BACKUP_DIR"
   local ip ngmap="/etc/nginx/conf.d/01-abuse-ip-deny.conf"
 
   echo "=== BLOCK ABUSE IPS $(date -u) ==="
+
   if command -v csf >/dev/null 2>&1; then
     for ip in "${ABUSE_IPS[@]}"; do
       csf -d "$ip" "110523 AbuseIPDB/scanner $(date +%F)" || true
       echo "CSF deny $ip"
     done
   else
-    echo "CSF not found — writing nginx deny map (and optional iptables notes)"
+    echo "CSF not installed — using nginx geo + iptables/ipset (+ Imunify if available)"
+  fi
+
+  # Imunify360 permanent blacklist (when present)
+  if command -v imunify360-agent >/dev/null 2>&1; then
+    for ip in "${ABUSE_IPS[@]}"; do
+      imunify360-agent blacklist ip add "$ip" --comment "110523 abusive scanner" 2>/dev/null \
+        || imunify360-agent ip-list local add --by-ip "$ip" 2>/dev/null \
+        || echo "WARN: imunify add failed for $ip (try UI / check subcommand)"
+    done
+  fi
+
+  # Kernel-level drop via ipset + iptables (persistent until reboot unless saved)
+  if command -v ipset >/dev/null 2>&1 && command -v iptables >/dev/null 2>&1; then
+    ipset create cw_abuse hash:ip -exist
+    for ip in "${ABUSE_IPS[@]}"; do
+      ipset add cw_abuse "$ip" -exist
+      echo "ipset add $ip"
+    done
+    iptables -C INPUT -m set --match-set cw_abuse src -j DROP 2>/dev/null \
+      || iptables -I INPUT -m set --match-set cw_abuse src -j DROP
+    iptables -C INPUT -p tcp -m multiport --dports 80,443 -m set --match-set cw_abuse src -j DROP 2>/dev/null \
+      || true
+    echo "iptables DROP active for set cw_abuse"
+  elif command -v iptables >/dev/null 2>&1; then
+    for ip in "${ABUSE_IPS[@]}"; do
+      iptables -C INPUT -s "$ip" -j DROP 2>/dev/null || iptables -I INPUT -s "$ip" -j DROP
+      echo "iptables DROP $ip"
+    done
   fi
 
   {
-    echo "# AbuseIPDB 98–100 scanners observed on 110523 — ${STAMP}"
+    echo "# Abuse scanners observed on 110523 — ${STAMP}"
     echo "geo \$cw_abuse_ip {"
     echo "    default 0;"
     for ip in "${ABUSE_IPS[@]}"; do
