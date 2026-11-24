@@ -466,7 +466,36 @@ echo; echo "processes in uninterruptible sleep (D state) right now:"; ps -eo sta
 echo; echo "longest cumulative CPU time among running processes:"; ps -eo pid,etime,time,comm --sort=-time 2>/dev/null | head -6
 
 hdr "4 KERNEL AND SERVICE EVENTS"
-{ dmesg -T 2>/dev/null || dmesg 2>/dev/null; } | grep -iE 'out of memory|oom-kill|soft lockup|hung task|segfault|thermal|throttl|blocked for more than' | tail -12
+echo "-- dmesg OOM / hang / throttle (current boot) --"
+{ dmesg -T 2>/dev/null || dmesg 2>/dev/null; } | grep -iE 'out of memory|oom-kill|Killed process|soft lockup|hung task|segfault|thermal|throttl|blocked for more than' | tail -20
+echo
+echo "-- syslog OOM token counts (current syslog) --"
+grep -i "oom" /var/log/syslog 2>/dev/null | awk '{print $7}' | sort | uniq -c | sort -nr | head -20
+echo
+echo "-- previous boot kernel OOM (journalctl -b -1) --"
+if command -v journalctl >/dev/null 2>&1; then
+  journalctl -b -1 -k --no-pager 2>/dev/null | grep -iE 'oom|out of memory|killed process|oom-kill' | tail -20
+else
+  echo "journalctl not available"
+fi
+echo
+echo "-- Failed lines in current syslog (token counts) --"
+grep "Failed" /var/log/syslog 2>/dev/null | awk '{print $7}' | sort | uniq -c | sort -nr | head -20
+echo
+echo "-- Failed lines in current syslog (full unique lines, top) --"
+grep "Failed" /var/log/syslog 2>/dev/null | sort | uniq -c | sort -nr | head -20
+echo
+echo "-- Failed lines in rotated syslog.*.gz (top) --"
+zgrep "Failed" /var/log/syslog.*.gz 2>/dev/null | sort | uniq -c | sort -nr | head -20
+echo
+echo "-- kernel BUG / Oops / panic (kern.log*) --"
+zgrep -h -iE 'BUG|Oops|kernel panic' /var/log/kern.log* 2>/dev/null | tail -20
+echo
+echo "-- bug mentions in rotated syslog --"
+zgrep -h -E 'bug' /var/log/syslog.*.gz 2>/dev/null | tail -10
+echo
+echo "-- kernel|panic|Oops|critical in syslog.1.gz --"
+zgrep -h -E 'kernel|panic|Oops|critical' /var/log/syslog.1.gz 2>/dev/null | tail -20
 FU=$(systemctl --failed --no-legend 2>/dev/null | head -8); [ -n "$FU" ] && { echo "failed units:"; echo "$FU"; }
 if command -v journalctl >/dev/null 2>&1; then
   RL=$(journalctl --since "-6 hours" --no-pager -o cat 2>/dev/null | grep -E 'Scheduled restart job|Failed with result' | awk -F': ' '{print $1}' | sort | uniq -c | sort -rn | head -5)
@@ -500,6 +529,45 @@ echo
 echo "Reading notes: this describes only the ${WINDOW}s window above. If load average is far above what was sampled, the heavy period was earlier and the history, logs and kernel events cover it."
 CPUEOF
 bash /root/cpucheck.sh 60 15 2>&1 | tee /root/cpucheck-$(date -u +%Y%m%dT%H%M%SZ).txt
+
+# --- 542b: OOM / auto-healing / service restart timeline (missing from Osama cpucheck) ---
+echo -e "\n=========================================================="
+echo " OOM / auto-healing / service restart timeline"
+echo "=========================================================="
+echo "Generated UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo
+echo "-- dmesg: Out of memory / Killed process (full match, current boot) --"
+dmesg -T 2>/dev/null | grep -iE 'Out of memory|Killed process|oom-kill' | tail -40
+echo
+echo "-- syslog + rotated: oom-kill / Out of memory / Killed process --"
+{ grep -h -iE 'oom-kill|Out of memory|Killed process' /var/log/syslog 2>/dev/null
+  zgrep -h -iE 'oom-kill|Out of memory|Killed process' /var/log/syslog.*.gz 2>/dev/null
+} | sort -u | tail -60
+echo
+echo "-- syslog + rotated: mariadb / mysql restart, fail, oom --"
+{ grep -h -iE 'mariadb|mysqld' /var/log/syslog 2>/dev/null | grep -iE 'start|stop|fail|oom|kill|restart|Main process'
+  zgrep -h -iE 'mariadb|mysqld' /var/log/syslog.*.gz 2>/dev/null | grep -iE 'start|stop|fail|oom|kill|restart|Main process'
+} | sort -u | tail -40
+echo
+echo "-- syslog + rotated: nginx / php-fpm / redis / varnish / apache restart or fail --"
+{ grep -h -iE 'nginx\.service|php[0-9.]*-fpm|redis-server|varnish|apache2' /var/log/syslog 2>/dev/null | grep -iE 'start|stop|fail|restart|Main process|exited'
+  zgrep -h -iE 'nginx\.service|php[0-9.]*-fpm|redis-server|varnish|apache2' /var/log/syslog.*.gz 2>/dev/null | grep -iE 'start|stop|fail|restart|Main process|exited'
+} | sort -u | tail -40
+echo
+echo "-- syslog + rotated: monit / auto-healing / imunify agent fail --"
+{ grep -h -iE 'monit|auto.?heal|imunify360-agent|Failed to start|Failed with result' /var/log/syslog 2>/dev/null
+  zgrep -h -iE 'monit|auto.?heal|imunify360-agent|Failed to start|Failed with result' /var/log/syslog.*.gz 2>/dev/null
+} | grep -iE 'monit|heal|imunify|mariadb|mysql|nginx|php|redis|varnish|oom|kill' | sort -u | tail -40
+echo
+echo "-- journalctl previous boot (-b -1) OOM / killed process --"
+journalctl -b -1 -k --no-pager 2>/dev/null | grep -iE 'oom|out of memory|killed process|oom-kill' | tail -30
+echo
+echo "-- MySQL Max_used_connections / Threads snapshot (live) --"
+mysql --connect-timeout=3 -e "SHOW GLOBAL STATUS WHERE Variable_name IN ('Max_used_connections','Threads_connected','Threads_running','Aborted_connects','Uptime');" 2>/dev/null
+echo
+echo "-- Memory / swap snapshot --"
+free -m
+echo "OOM / auto-healing timeline section done."
 
 # --- 543: Redis deep diagnosis (auth discovery + full suite) ---
 echo -e "\n=========================================================="
